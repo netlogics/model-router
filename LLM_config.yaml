@@ -1,0 +1,111 @@
+# =============================================================================
+# LiteLLM proxy: OpenJev decides which worker serves each request.
+#
+#   client -> :4000 model=jev-router -> decider rewrites model -> worker
+#
+# The virtual model `jev-router` exists only to be intercepted. The callback in
+# decider.py asks OpenJev which worker fits, rewrites `model`, and LiteLLM
+# dispatches, retries, falls back and attributes cost as it would for any
+# direct call.
+#
+#   PYTHONPATH=. litellm --config LLM_config.yaml --port 4000
+#
+# Before reaching for this at all, read the note at the bottom: LiteLLM has
+# shipped auto-routing with a built-in JEV classifier, and it may already do
+# what this file is arranging by hand.
+# =============================================================================
+
+model_list:
+  # Anthropic. Prices are per million tokens, input/output, as of 2026-09.
+  - model_name: haiku            # $1 / $5      200K context
+    litellm_params:
+      model: anthropic/claude-haiku-4-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+  - model_name: sonnet           # $3 / $15     1M context
+    litellm_params:              # ($2 / $10 introductory through 2026-08-31)
+      model: anthropic/claude-sonnet-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+  - model_name: opus             # $5 / $25     1M context
+    litellm_params:
+      model: anthropic/claude-opus-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+  # Self-hosted. Free at the margin, and the only workers that may see data
+  # which must not leave the building.
+  - model_name: orinth-local     # the 4050 box
+    litellm_params:
+      model: openai/orinth
+      base_url: http://localhost:8003/v1
+      api_key: none
+
+  - model_name: vast-local       # the rented GPU
+    litellm_params:
+      model: openai/local-large
+      base_url: os.environ/VAST_BASE_URL
+      api_key: os.environ/VAST_API_KEY
+
+  # The virtual model clients ask for. Points at haiku so an unrouted request
+  # still answers if the callback fails to load.
+  - model_name: jev-router
+    litellm_params:
+      model: anthropic/claude-haiku-4-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+litellm_settings:
+  # This is the supported way to reach a request from a YAML-configured proxy:
+  # module path, then the instance within it.
+  #
+  # There is no `pre_call_hooks` key inside a model_list entry. An unknown key
+  # there is not rejected, it is passed through to the provider call and
+  # ignored, so a hook configured that way silently never runs.
+  callbacks: ["decider.proxy_handler_instance"]
+
+router_settings:
+  # Applied after the decision, so a worker chosen for a request too long for
+  # its context window is escalated rather than refused.
+  enable_pre_call_checks: true
+  num_retries: 2
+  fallbacks:
+    - opus: ["sonnet"]
+    - sonnet: ["haiku"]
+    # A local worker must NOT fall back to a hosted one. The whole reason a
+    # request was routed local is that its contents may not leave the building,
+    # and a silent failover would send it anyway.
+    - orinth-local: ["vast-local"]
+    - vast-local: ["orinth-local"]
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+
+# =============================================================================
+# Consider before keeping any of this
+#
+# LiteLLM shipped Auto Routing in v1.94.x, and one of its classifier backends
+# is JEV itself. If hosted TypeSafe Jev is acceptable, the whole of decider.py
+# collapses into config:
+#
+#   - model_name: smart-router
+#     litellm_params:
+#       model: auto_router/complexity_router
+#       complexity_router_config:
+#         tiers:
+#           SIMPLE:    haiku
+#           MEDIUM:    sonnet
+#           COMPLEX:   sonnet
+#           REASONING: opus
+#     complexity_router_default_model: haiku
+#
+# Reasons to keep the hook anyway, all of them about control rather than
+# capability:
+#
+#   - The tiers are complexity. "This contains customer data, keep it local" is
+#     not a point on that scale, and both local routes above are exactly that
+#     kind of decision.
+#   - Its tiers are models. They cannot express "OpenJev answers this itself and
+#     no LLM is called", which is the largest cost saving available here.
+#   - Auto Routing is beta, and its own docs say the config keys may change.
+#   - Self-hosted OpenJev keeps the routing decision -- which sees every
+#     request -- inside your own network.
+# =============================================================================

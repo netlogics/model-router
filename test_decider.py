@@ -1,0 +1,283 @@
+"""Tests for the routing decision, offline.
+
+The bug these exist to prevent was silent. The first version of decider.py
+read `answers.route.choices[0].label`, which is not the documented shape, so
+every response raised KeyError inside a try/except and every request fell back
+to the default worker. Nothing failed, nothing logged, and the OpenJev call
+became pure added latency -- the system looked like it was routing.
+
+So the responses below are written to the published /v1/systemone schema, and
+choose() is tested against them directly. No network, no litellm, no shim.
+
+    pytest
+"""
+
+import pytest
+
+import decider
+
+
+def choice_response(choice, probabilities, confidence=0.9):
+    """A /v1/systemone response, in the documented shape.
+
+    probabilities is an object keyed by option name -- not an array, and not a
+    list of {label, probability} pairs.
+    """
+    return {
+        "answers": {
+            "route": {
+                "type": "choice",
+                "choice": choice,
+                "confidence": confidence,
+                "probabilities": probabilities,
+            }
+        }
+    }
+
+
+class TestChoose:
+    def test_takes_the_option_openjev_named(self):
+        body = choice_response("sonnet", {"sonnet": 0.82, "haiku": 0.15, "opus": 0.03})
+
+        assert decider.choose(body) == "sonnet"
+
+    def test_the_option_name_is_the_worker_name(self):
+        # Nothing maps a label to a model. The criteria keys are the model
+        # names LiteLLM knows, so the answer is usable as it stands.
+        for worker in decider.ROUTES:
+            body = choice_response(worker, {worker: 1.0})
+
+            assert decider.choose(body) == worker
+
+    def test_falls_back_when_the_winner_is_below_the_gate(self):
+        split = {"sonnet": 0.4, "haiku": 0.35, "opus": 0.25}
+
+        assert decider.choose(choice_response("sonnet", split)) is None
+
+    # Confidence and the winner's probability are different numbers. A high
+    # confidence on a distribution whose winner is weak must not get through
+    # the gate: it is the mass on the option being acted upon that matters.
+    def test_a_confident_response_with_a_weak_winner_still_falls_back(self):
+        body = choice_response(
+            "sonnet", {"sonnet": 0.4, "haiku": 0.35, "opus": 0.25}, confidence=0.99
+        )
+
+        assert decider.choose(body) is None
+
+    def test_falls_back_on_an_option_that_is_not_a_worker(self):
+        assert decider.choose(choice_response("gemini", {"gemini": 1.0})) is None
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            {},
+            None,
+            {"answers": {}},
+            {"answers": {"route": None}},
+            # The shape the first version of this file expected. If it ever
+            # comes back, it must fall back loudly rather than be mistaken for
+            # an answer.
+            {"answers": {"route": {"choices": [{"label": "sonnet", "probability": 0.9}]}}},
+        ],
+    )
+    def test_falls_back_on_anything_it_does_not_recognise(self, body):
+        assert decider.choose(body) is None
+
+
+class TestContext:
+    def test_keeps_the_end_of_a_long_conversation(self):
+        messages = [
+            {"role": "user", "content": "x" * 5000},
+            {"role": "user", "content": "the actual question"},
+        ]
+
+        assert decider.context_from(messages).endswith("the actual question")
+
+    def test_stays_within_its_budget(self):
+        messages = [{"role": "user", "content": "x" * 100} for _ in range(50)]
+
+        assert len(decider.context_from(messages, budget=500)) <= 500
+
+    def test_reads_typed_content_parts(self):
+        messages = [{"role": "user", "content": [
+            {"type": "text", "text": "hello"},
+            {"type": "image_url", "image_url": {"url": "..."}},
+        ]}]
+
+        assert decider.context_from(messages) == "hello"
+
+    def test_ignores_system_messages(self):
+        # A system prompt is the same on every request, so it carries no signal
+        # about which worker this one needs.
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "hi"},
+        ]
+
+        assert decider.context_from(messages) == "hi"
+
+    def test_says_so_rather_than_sending_an_empty_state(self):
+        assert decider.context_from([]) == "No user input."
+
+
+class TestRequest:
+    def test_asks_one_question(self):
+        # An unused second question is a second distribution read on every
+        # request. The first version asked for a complexity score and threw it
+        # away.
+        assert list(build_questions()) == ["route"]
+
+    def test_gives_every_option_a_description(self):
+        # OpenJev reads the criteria to learn what the options mean. Bare model
+        # names with null descriptions ask it to route on the strings.
+        criteria = build_questions()["route"]["criteria"]
+
+        assert set(criteria) == set(decider.ROUTES)
+        assert all(isinstance(text, str) and text for text in criteria.values())
+
+    def test_sends_the_conversation_as_state(self):
+        payload = decider.build_request([{"role": "user", "content": "hello"}])
+
+        assert payload["state"] == "hello"
+
+
+def build_questions():
+    return decider.build_request([{"role": "user", "content": "hi"}])["questions"]
+
+
+class TestAvailability:
+    """Which workers are offered at all.
+
+    A rented GPU runs a few hours a day, so the option set is a runtime fact.
+    """
+
+    @pytest.fixture(autouse=True)
+    def clear_cache(self):
+        decider._health.clear()
+        yield
+        decider._health.clear()
+
+    @pytest.mark.asyncio
+    async def test_always_offers_the_hosted_routes(self, monkeypatch):
+        _stub_probe(monkeypatch, up=False)
+
+        assert set(await decider.available_routes()) == set(decider.ALWAYS_UP)
+
+    @pytest.mark.asyncio
+    async def test_offers_a_local_worker_that_answers(self, monkeypatch):
+        _stub_probe(monkeypatch, up=True)
+        monkeypatch.setitem(decider.PROBES, "vast-local", "http://gpu:8000/v1")
+
+        assert "vast-local" in await decider.available_routes()
+
+    # The important one. A confident, correct decision to keep a request local
+    # is worse than useless if that worker is switched off: dispatch fails and
+    # the fallback sends it off-premises anyway.
+    @pytest.mark.asyncio
+    async def test_withholds_a_local_worker_that_is_down(self, monkeypatch):
+        _stub_probe(monkeypatch, up=False)
+        monkeypatch.setitem(decider.PROBES, "vast-local", "http://gpu:8000/v1")
+
+        assert "vast-local" not in await decider.available_routes()
+
+    @pytest.mark.asyncio
+    async def test_treats_an_unconfigured_worker_as_absent(self, monkeypatch):
+        monkeypatch.setitem(decider.PROBES, "vast-local", "")
+
+        assert await decider._is_up("vast-local", "") is False
+
+    @pytest.mark.asyncio
+    async def test_does_not_probe_again_within_the_cache_window(self, monkeypatch):
+        probes = _stub_probe(monkeypatch, up=True)
+
+        await decider._is_up("vast-local", "http://gpu:8000/v1")
+        await decider._is_up("vast-local", "http://gpu:8000/v1")
+
+        assert probes["count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_a_withheld_route_cannot_be_chosen(self, monkeypatch):
+        # Even if OpenJev names it -- a stale model, a replayed response --
+        # an option that was not offered is not an answer.
+        _stub_probe(monkeypatch, up=False)
+        routes = await decider.available_routes()
+
+        body = choice_response("vast-local", {"vast-local": 1.0})
+
+        assert decider.choose(body, routes) is None
+
+
+class TestDecide:
+    """The network path, with the transport stubbed."""
+
+    @pytest.fixture(autouse=True)
+    def no_local_workers(self, monkeypatch):
+        _stub_probe(monkeypatch, up=False)
+        decider._health.clear()
+        yield
+        decider._health.clear()
+
+    @pytest.mark.asyncio
+    async def test_returns_the_chosen_worker(self, monkeypatch):
+        _stub_post(monkeypatch, json=choice_response("sonnet", {"sonnet": 0.9}))
+
+        assert await decider.decide([{"role": "user", "content": "hi"}]) == "sonnet"
+
+    @pytest.mark.asyncio
+    async def test_fails_open_when_the_shim_is_unreachable(self, monkeypatch):
+        # The point of the fallback: a decider that is down degrades the
+        # choice, it does not take the service with it.
+        import httpx
+
+        async def refuse(*_args, **_kwargs):
+            raise httpx.ConnectError("connection refused")
+
+        monkeypatch.setattr(decider._client, "post", refuse)
+
+        assert await decider.decide([]) == decider.DEFAULT_MODEL
+
+    @pytest.mark.asyncio
+    async def test_fails_open_on_a_timeout(self, monkeypatch):
+        import httpx
+
+        async def hang(*_args, **_kwargs):
+            raise httpx.ReadTimeout("too slow")
+
+        monkeypatch.setattr(decider._client, "post", hang)
+
+        assert await decider.decide([]) == decider.DEFAULT_MODEL
+
+    @pytest.mark.asyncio
+    async def test_fails_open_on_an_unrecognised_body(self, monkeypatch):
+        _stub_post(monkeypatch, json={"answers": {"route": {"choices": []}}})
+
+        assert await decider.decide([]) == decider.DEFAULT_MODEL
+
+
+def _stub_probe(monkeypatch, up):
+    """Stub the health probe. Returns a dict whose "count" tracks calls."""
+    probes = {"count": 0}
+
+    class Response:
+        status_code = 200 if up else 503
+
+    async def get(*_args, **_kwargs):
+        probes["count"] += 1
+        return Response()
+
+    monkeypatch.setattr(decider._client, "get", get)
+    return probes
+
+
+def _stub_post(monkeypatch, json):
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return json
+
+    async def post(*_args, **_kwargs):
+        return Response()
+
+    monkeypatch.setattr(decider._client, "post", post)
