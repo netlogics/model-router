@@ -5,12 +5,11 @@ serve it — a strong model, a cheap one, or a local one for anything that must
 not leave the building.
 
 ```
- client ──► LiteLLM :4000            model: "jev-router"
+ client ──► LiteLLM :4000            model: "laya-router"
               │
-              ├──► OpenJev :8001  /v1/systemone  ~70–500ms, typed answer
-              │                                  (26B-A4B, NVFP4, ~14GB)
+              ├──► laya :8000   /v1/systemone  ~70–500ms, typed answer
               │
-              └──► openjev-direct   answered by the decision model, no LLM
+              └──► laya-direct    answered by the decision model, no LLM
                    orinth-local     Ornith-1.5-35B-A3B on the laptop
                    vast-local       the rented GPU, when it is up
                    haiku │ sonnet │ opus
@@ -29,11 +28,10 @@ request. Three ways to do it, roughly in order of cost:
 
 The third option is what most hand-rolled routers do, and it is the one with
 the failure mode that bites: the classifier answers in prose, the parse fails,
-and the fallback swallows it. OpenJev avoids that by construction — it reads
-the answer off the probability distribution at a single output position instead
-of generating text, so the reply is one of *your* option names with a
-calibrated probability attached. There is no parse step, so there is no parse
-step to fail.
+and the fallback swallows it. **laya** avoids that by construction — it reads
+the answer off the probability distribution at a single forward pass instead of
+generating text, so the reply is one of *your* option names with a calibrated
+probability attached. There is no parse step, so there is no parse step to fail.
 
 That property is worth more than the accuracy numbers. A router that is wrong
 10% of the time costs you some quality; a router that *silently stops routing*
@@ -56,37 +54,33 @@ classifier backends is JEV. If hosted TypeSafe Jev is acceptable, most of
 of `LLM_config.yaml`. Keep the hook if you need routing on something that is
 not complexity, if beta config keys are a problem, or if the decision itself
 must stay in your network. Two routes here are outside a complexity ladder by
-construction: `openjev-direct`, where no LLM is called at all, and the local
+construction: `laya-direct`, where no LLM is called at all, and the local
 routes, where "this must not leave the building" is not a point on that scale.
 
-## Which OpenJev
+## Which laya
 
-Two different projects share the name, and they differ on the thing that
-decides whether you can ship:
+`convaiinnovations/laya-typed-decisions` is a ModernBERT-large checkpoint
+trained for exactly this shape of question — a typed-decisions task over a
+fixed answer space, answered from the probability distribution at a single
+output position rather than by generating prose. It runs in about 1024 tokens
+of context, which is why `decider.py` sends only the tail of the conversation.
+It serves the same `/v1/systemone` API directly, so the whole decision is one
+HTTP call with no shim in front of it.
 
-| | Weights | Fits 32GB? | Licence |
-|---|---|---|---|
-| [`openjev/openjev`](https://huggingface.co/openjev/openjev) | 27B, bf16 (~54GB) | no | **CC BY-NC 4.0** — non-commercial |
-| [`razorback16/openjev`](https://github.com/razorback16/openjev) | DiffusionGemma 26B-A4B, NVFP4 (~14GB) | **yes** | **Apache-2.0** |
-
-**This starter targets the second.** On an RTX 5090 it is the only one of the
-two that fits at all — 32GB of VRAM against 54GB of bf16 weights — NVFP4 is
-native on Blackwell rather than emulated, and Apache-2.0 is what lets the
-result ship to a customer. Both serve the same `/v1/systemone` API, so the
-choice is a URL change.
-
-One thing to check after quantizing: the whole value here is *calibrated*
-probabilities, and 4-bit weights move the distribution. Re-fit `MIN_PROB`
-against the quantized model rather than carrying a threshold over from an
-fp16 evaluation.
+One thing to check after the model is loaded: the whole value here is
+*calibrated* probabilities, and quantized or fine-tuned weights move the
+distribution. Re-fit `MIN_PROB` against your model rather than carrying a
+threshold over from an evaluation you did not run.
 
 ## Run
 
 ```bash
-# 1) The decision model + its /v1/systemone server (razorback16/openjev)
-vllm serve nvidia/diffusiongemma-26B-A4B-it-NVFP4 \
-  --served-model-name dgemma --diffusion-config '{"canvas_length": 64}' \
-  --max-logprobs 32 --enable-prefix-caching --port 8001
+# 1) The decision model + its /v1/systemone server
+#    (laya_runner.py is a CPython 3.14 workaround — see below)
+LAYA_PORT=8000 LAYA_DEVICE=cpu python laya_runner.py
+
+#    ...or, on a Python where torch.compile actually imports, the plain path:
+LAYA_PORT=8000 LAYA_DEVICE=cpu laya-serve
 
 # 2) Your local workers, on their own ports
 llama-server -m Ornith-1.5-35B-A3B-Q4_K_M.gguf --port 8003   # the laptop
@@ -99,11 +93,30 @@ ANTHROPIC_API_KEY=... LITELLM_MASTER_KEY=... \
 # 4) Call it
 curl http://localhost:4000/v1/chat/completions \
   -H 'content-type: application/json' \
-  -d '{"model":"jev-router","messages":[{"role":"user","content":"Hi"}]}'
+  -d '{"model":"laya-router","messages":[{"role":"user","content":"Hi"}]}'
 ```
+
+`LAYA_PORT` / `LAYA_DEVICE` configure the decision server; `LAYA_API_KEY`
+(authenticated calls) and `LAYA_DECISION_MODEL` (the typed-decisions task) are
+optional. `LAYA_DECISION_MODEL` is read at call-time so it can be overridden per
+process.
 
 `PYTHONPATH=.` is not optional — it is how `decider.proxy_handler_instance`
 resolves.
+
+### Why `laya_runner.py` instead of `laya-serve`?
+
+`laya` loads ModernBERT through `transformers`, and the current `transformers`
+decorates ModernBERT's `forward` with `@torch.compile(dynamic=True)`. Torch
+refuses to even import that decorator on CPython 3.14+::
+
+    RuntimeError: torch.compile is not supported on Python 3.14+
+
+Compiling is a pure-speed optimisation; the uncompiled graph runs identically,
+just more slowly. `laya_runner.py` swaps `torch.compile` for a passthrough
+decorator before `laya.serve.main()` runs, so the model imports and serves on
+3.14 unchanged. On a Python where `torch.compile` works it simply leaves the
+model uncompiled — so the plain `laya-serve` entry point is fine anywhere else.
 
 ## Tests
 
@@ -119,14 +132,14 @@ before — see below.
 
 | | Default | |
 |---|---|---|
-| `OPENJEV_SHIM_URL` | `http://localhost:3000` | |
-| `OPENJEV_DEFAULT_MODEL` | `haiku` | Where every fallback goes |
-| `OPENJEV_MIN_PROB` | `0.5` | Mass on the winning option before it is used |
-| `OPENJEV_TIMEOUT_S` | `1.0` | Hard cap; the shim answers in well under it |
-| `OPENJEV_CONTEXT_CHARS` | `4000` | Tail of the conversation sent as `state` |
-| `OPENJEV_VIRTUAL_MODEL` | `jev-router` | The name that triggers routing |
-| `OPENJEV_HEALTH_TTL_S` | `30` | How long a worker health probe is trusted |
-| `OPENJEV_PROBE_TIMEOUT_S` | `0.3` | Probe cap; must not eat the decision budget |
+| `LAYA_BASE_URL` | `http://localhost:8000` | Where laya serves `/v1/systemone` |
+| `LAYA_DEFAULT_MODEL` | `orinth-local` | Where every fallback goes |
+| `LAYA_MIN_PROB` | `0.5` | Mass on the winning option before it is used |
+| `LAYA_TIMEOUT_S` | `1.0` | Hard cap; laya answers in well under it |
+| `LAYA_CONTEXT_CHARS` | `4000` | Tail of the conversation sent as `state` |
+| `LAYA_VIRTUAL_MODEL` | `laya-router` | The name that triggers routing |
+| `LAYA_HEALTH_TTL_S` | `30` | How long a worker health probe is trusted |
+| `LAYA_PROBE_TIMEOUT_S` | `0.3` | Probe cap; must not eat the decision budget |
 | `ORNITH_BASE_URL` | `:8003/v1` | Local laptop worker |
 | `VAST_BASE_URL` | unset | Rented GPU; unset means "not a route" |
 
@@ -135,19 +148,19 @@ before — see below.
 A rented GPU runs a few hours a day, so which workers exist is a runtime fact,
 not a config-file one. Availability is resolved **before** the question is
 asked: a worker that does not answer a health probe is simply not one of the
-options OpenJev is given.
+options laya is given.
 
 That ordering matters more than it looks. Offering a switched-off worker is
 worse than picking the wrong one — the decision comes back confident and
 correct, dispatch fails, and the fallback sends the request somewhere the
 decision deliberately avoided. For a privacy route that is not a degraded
-answer but the wrong one: the request leaves the building for exactly the
-reason it was meant to stay.
+answer but the wrong one: the request leaves the building for exactly the reason
+it was meant to stay.
 
 Two things deliberately fail open: a decision below `MIN_PROB`, and any error
-reaching the shim. A router that takes the service down when its decider is
-unreachable has made reliability worse — the fallback still answers, just
-without the benefit of a choice.
+reaching laya. A router that takes the service down when its decider is
+unreachable has made reliability worse, not better — the fallback still answers,
+just without the benefit of a choice.
 
 ## What was wrong with the first version
 
@@ -159,7 +172,7 @@ tests exist.
   shape is `answers.route.choice` (the option name), `.probabilities` (an
   object keyed by option name) and `.confidence`. Every response raised
   `KeyError` inside a `try/except` that returned the default — so every request
-  went to the default worker, nothing logged, and the OpenJev round trip was pure
+  went to the default worker, nothing logged, and the laya call became pure
   added latency. The system looked like it was routing.
 - **`pre_call_hooks:` inside a `model_list` entry is not a LiteLLM key.** Hooks
   are registered under `litellm_settings.callbacks`. An unknown key in
@@ -167,7 +180,7 @@ tests exist.
   never have run even after the parsing was fixed.
 - **`${OPENAI_API_KEY}` is not interpolated.** LiteLLM reads
   `os.environ/OPENAI_API_KEY`; the shell-style form is sent verbatim as the key.
-- **The router's vLLM and the `local-qwen` worker were both on `:8000`.**
+- **The router's LLM server and the `local-qwen` worker were both on `:8000`.**
 - **`criteria` gave every option a `null` description**, asking the model to
   route on the strings `"gpt-4o"` and `"gpt-4o-mini"`. The criteria are how a
   choice question conveys what the options mean.
@@ -175,7 +188,7 @@ tests exist.
   ordered array of level labels — and the score was computed on every request
   and then never read.
 - **A blocking `requests.post` inside an async proxy**, with a 10s timeout, on
-  a decision budgeted at half a second. One slow shim would stall the event
-  loop for every concurrent request.
+  a decision budgeted at half a second. One slow call would stall the event loop
+  for every concurrent request.
 - **The conversation was truncated from the front**, so a long chat routed on
   its oldest turns rather than on what was just asked.

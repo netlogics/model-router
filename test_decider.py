@@ -3,14 +3,16 @@
 The bug these exist to prevent was silent. The first version of decider.py
 read `answers.route.choices[0].label`, which is not the documented shape, so
 every response raised KeyError inside a try/except and every request fell back
-to the default worker. Nothing failed, nothing logged, and the OpenJev call
+to the default worker. Nothing failed, nothing logged, and the laya call
 became pure added latency -- the system looked like it was routing.
 
 So the responses below are written to the published /v1/systemone schema, and
-choose() is tested against them directly. No network, no litellm, no shim.
+choose() is tested against them directly. No network, no litellm, no server.
 
     pytest
 """
+
+import os
 
 import pytest
 
@@ -36,7 +38,7 @@ def choice_response(choice, probabilities, confidence=0.9):
 
 
 class TestChoose:
-    def test_takes_the_option_openjev_named(self):
+    def test_takes_the_named_option(self):
         body = choice_response("sonnet", {"sonnet": 0.82, "haiku": 0.15, "opus": 0.03})
 
         assert decider.choose(body) == "sonnet"
@@ -128,7 +130,7 @@ class TestRequest:
         assert list(build_questions()) == ["route"]
 
     def test_gives_every_option_a_description(self):
-        # OpenJev reads the criteria to learn what the options mean. Bare model
+        # laya reads the criteria to learn what the options mean. Bare model
         # names with null descriptions ask it to route on the strings.
         criteria = build_questions()["route"]["criteria"]
 
@@ -139,6 +141,25 @@ class TestRequest:
         payload = decider.build_request([{"role": "user", "content": "hello"}])
 
         assert payload["state"] == "hello"
+
+    def test_includes_the_decision_model_by_default(self, monkeypatch):
+        # laya never auto-selects a typed-decisions task, so the model must ride
+        # in the body. Leave any environment value out of the way to prove the
+        # default is what ships.
+        monkeypatch.delenv("LAYA_DECISION_MODEL", raising=False)
+
+        payload = decider.build_request([{"role": "user", "content": "hi"}])
+
+        assert payload["model"] == "typed-decisions"
+
+    def test_omits_the_model_when_unset(self, monkeypatch):
+        # An empty decision task means "ask the caller's own default": send no
+        # model at all rather than a literal empty string.
+        monkeypatch.setitem(os.environ, "LAYA_DECISION_MODEL", "")
+
+        payload = decider.build_request([{"role": "user", "content": "hi"}])
+
+        assert "model" not in payload
 
 
 def build_questions():
@@ -197,7 +218,7 @@ class TestAvailability:
 
     @pytest.mark.asyncio
     async def test_a_withheld_route_cannot_be_chosen(self, monkeypatch):
-        # Even if OpenJev names it -- a stale model, a replayed response --
+        # Even if laya names it -- a stale model, a replayed response --
         # an option that was not offered is not an answer.
         _stub_probe(monkeypatch, up=False)
         routes = await decider.available_routes()
@@ -224,7 +245,7 @@ class TestDecide:
         assert await decider.decide([{"role": "user", "content": "hi"}]) == "sonnet"
 
     @pytest.mark.asyncio
-    async def test_fails_open_when_the_shim_is_unreachable(self, monkeypatch):
+    async def test_fails_open_when_laya_is_unreachable(self, monkeypatch):
         # The point of the fallback: a decider that is down degrades the
         # choice, it does not take the service with it.
         import httpx
@@ -252,6 +273,52 @@ class TestDecide:
         _stub_post(monkeypatch, json={"answers": {"route": {"choices": []}}})
 
         assert await decider.decide([]) == decider.DEFAULT_MODEL
+
+    @pytest.mark.asyncio
+    async def test_forwards_the_bearer_key_when_configured(self, monkeypatch):
+        # laya refuses the request without it, so the key must ride along.
+        monkeypatch.setitem(os.environ, "LAYA_API_KEY", "s3cret")
+
+        captured = {}
+
+        class Response:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return choice_response("sonnet", {"sonnet": 1.0})
+
+        async def post(*_args, **_kwargs):
+            captured.update(_kwargs)
+            return Response()
+
+        monkeypatch.setattr(decider._client, "post", post)
+
+        assert await decider.decide([{"role": "user", "content": "hi"}]) == "sonnet"
+        assert captured["headers"].get("Authorization") == "Bearer s3cret"
+
+    @pytest.mark.asyncio
+    async def test_sends_no_auth_header_without_a_key(self, monkeypatch):
+        # Without LAYA_API_KEY there is nothing to prove, so no header goes out.
+        monkeypatch.delenv("LAYA_API_KEY", raising=False)
+
+        captured = {}
+
+        class Response:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return choice_response("sonnet", {"sonnet": 1.0})
+
+        async def post(*_args, **_kwargs):
+            captured.update(_kwargs)
+            return Response()
+
+        monkeypatch.setattr(decider._client, "post", post)
+
+        assert await decider.decide([{"role": "user", "content": "hi"}]) == "sonnet"
+        assert "Authorization" not in captured["headers"]
 
 
 def _stub_probe(monkeypatch, up):

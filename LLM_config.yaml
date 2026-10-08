@@ -1,10 +1,10 @@
 # =============================================================================
-# LiteLLM proxy: OpenJev decides which worker serves each request.
+# LiteLLM proxy: laya decides which worker serves each request.
 #
-#   client -> :4000 model=jev-router -> decider rewrites model -> worker
+#   client -> :4000 model=laya-router -> decider rewrites model -> worker
 #
-# The virtual model `jev-router` exists only to be intercepted. The callback in
-# decider.py asks OpenJev which worker fits, rewrites `model`, and LiteLLM
+# The virtual model `laya-router` exists only to be intercepted. The callback in
+# decider.py asks laya which worker fits, rewrites `model`, and LiteLLM
 # dispatches, retries, falls back and attributes cost as it would for any
 # direct call.
 #
@@ -48,7 +48,7 @@ model_list:
 
   # The virtual model clients ask for. Points at haiku so an unrouted request
   # still answers if the callback fails to load.
-  - model_name: jev-router
+  - model_name: laya-router
     litellm_params:
       model: anthropic/claude-haiku-4-5
       api_key: os.environ/ANTHROPIC_API_KEY
@@ -103,9 +103,9 @@ general_settings:
 #   - The tiers are complexity. "This contains customer data, keep it local" is
 #     not a point on that scale, and both local routes above are exactly that
 #     kind of decision.
-#   - Its tiers are models. They cannot express "OpenJev answers this itself and
+#   - Its tiers are models. They cannot express "laya answers this itself and
 #     no LLM is called", which is the largest cost saving available here.
 #   - Auto Routing is beta, and its own docs say the config keys may change.
-#   - Self-hosted OpenJev keeps the routing decision -- which sees every
+#   - Self-hosted laya keeps the routing decision -- which sees every
 #     request -- inside your own network.
 # =============================================================================

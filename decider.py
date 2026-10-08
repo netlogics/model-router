@@ -1,6 +1,6 @@
-"""Route each request to a worker model, using OpenJev to make the call.
+"""Route each request to a worker model, using laya to make the call.
 
-OpenJev answers typed questions by reading probabilities off a single forward
+laya answers typed questions by reading probabilities off a single forward
 pass rather than generating text, so "which worker should serve this?" comes
 back as one of *your* option names with a calibrated probability attached, in
 roughly 70-500ms. That is the property that makes it usable on the hot path:
@@ -10,11 +10,10 @@ The decision logic here is deliberately free of any LiteLLM import, so it can
 be exercised without the proxy installed -- see test_decider.py. LiteLLM is
 imported lazily at the bottom, where the hook is defined.
 
-Serve OpenJev first (see README):
+Serve laya first (see README). It exposes /v1/systemone directly over HTTP on
+LAYA_PORT (default 8000), so there is no shim in front of it:
 
-    vllm serve ./openjev --port 8001
-    VLLM=http://localhost:8001/v1 TOKENIZER=./openjev READOUT_T=0.85 \
-        python openjev/helper/shim.py --port 3000
+    LAYA_PORT=8000 LAYA_DEVICE=cpu python laya_runner.py
 """
 
 from __future__ import annotations
@@ -27,44 +26,44 @@ import httpx
 
 log = logging.getLogger(__name__)
 
-SHIM_URL = os.environ.get("OPENJEV_SHIM_URL", "http://localhost:3000")
-DEFAULT_MODEL = os.environ.get("OPENJEV_DEFAULT_MODEL", "haiku")
+LAYA_BASE_URL = os.environ.get("LAYA_BASE_URL", "http://localhost:8000")
+DEFAULT_MODEL = os.environ.get("LAYA_DEFAULT_MODEL", "orinth-local")
 
 # Minimum probability mass on the winning option before the decision is used.
-# This is the winner's own probability, not OpenJev's `confidence` -- see
+# This is the winner's own probability, not laya's `confidence` -- see
 # choose() for why the two are not interchangeable.
-MIN_PROB = float(os.environ.get("OPENJEV_MIN_PROB", "0.5"))
+MIN_PROB = float(os.environ.get("LAYA_MIN_PROB", "0.5"))
 
-# A router that can add ten seconds to a request is worse than no router. The
-# shim answers in well under a second, so anything past this is a fault and
+# A router that can add ten seconds to a request is worse than no router. laya
+# answers in well under a second, so anything past this is a fault and
 # should be treated as one rather than waited out.
-TIMEOUT_S = float(os.environ.get("OPENJEV_TIMEOUT_S", "1.0"))
+TIMEOUT_S = float(os.environ.get("LAYA_TIMEOUT_S", "1.0"))
 
 # A health probe is a local round trip and must not eat the decision budget.
-PROBE_TIMEOUT_S = float(os.environ.get("OPENJEV_PROBE_TIMEOUT_S", "0.3"))
+PROBE_TIMEOUT_S = float(os.environ.get("LAYA_PROBE_TIMEOUT_S", "0.3"))
 
 # Characters of conversation to route on. Routing needs the shape of the
-# request, not the whole transcript, and the shim charges for what it reads.
-CONTEXT_CHARS = int(os.environ.get("OPENJEV_CONTEXT_CHARS", "4000"))
+# request, not the whole transcript, and laya charges for what it reads.
+CONTEXT_CHARS = int(os.environ.get("LAYA_CONTEXT_CHARS", "4000"))
 
 # How long a health probe is trusted. Rented GPUs run a few hours a day, so
 # which workers exist changes during the day rather than at deploy time.
-HEALTH_TTL_S = float(os.environ.get("OPENJEV_HEALTH_TTL_S", "30"))
+HEALTH_TTL_S = float(os.environ.get("LAYA_HEALTH_TTL_S", "30"))
 
 # The option names ARE the worker model names in LiteLLM's model_list, so the
 # answer is used directly and there is no label mapping to get wrong.
 #
-# The descriptions are not decoration: for a choice question OpenJev reads the
+# The descriptions are not decoration: for a choice question laya reads the
 # criteria to understand what each option means. Passing bare model names with
 # no description asks it to route on the strings "gpt-4o" and "gpt-4o-mini".
 ROUTES = {
-    # The cheapest possible outcome: the request *is* a decision, so OpenJev
+    # The cheapest possible outcome: the request *is* a decision, so laya
     # answers it and no LLM is called at all. Classification, yes/no, scoring,
     # ranking, guardrail checks, picking one option from a fixed set. Routing
     # is only one instance of this shape -- the model is a general typed-answer
     # engine, and every request served here costs a forward pass instead of a
     # per-token bill.
-    "openjev-direct": (
+    "laya-direct": (
         "The request is itself a decision with a fixed answer space: classify "
         "this, is this X yes or no, score this, pick one of these options, does "
         "this violate a policy. Anything answerable by choosing a label rather "
@@ -98,7 +97,7 @@ ROUTES = {
 
 # Hosted routes, plus the decision model itself, which is up whenever this hook
 # is running. LiteLLM owns retries and failover for these.
-ALWAYS_UP = ("openjev-direct", "haiku", "sonnet", "opus")
+ALWAYS_UP = ("laya-direct", "haiku", "sonnet", "opus")
 
 # Self-hosted routes, and where to probe them. A rented GPU is up for part of
 # the day; a laptop is up when it is open.
@@ -157,7 +156,7 @@ async def _is_up(route, base_url):
 
     _health[route] = (now, is_up)
     if is_up != was_up:
-        log.info("openjev: %s is now %s", route, "up" if is_up else "down")
+        log.info("laya: %s is now %s", route, "up" if is_up else "down")
 
     return is_up
 
@@ -215,8 +214,14 @@ def build_request(messages, routes=None):
     is latency with no consumer.
 
     `routes` is the currently-serving subset -- see available_routes().
+
+    laya never auto-selects a typed-decisions task, so the decision task the
+    caller wants routed is carried in the body too. It is read at call-time
+    (like LAYA_API_KEY) so it can be monkeypatched in tests: leave it unset to
+    send nothing and let the caller's own default stand, though "typed-decisions"
+    is the sensible default.
     """
-    return {
+    payload = {
         "state": context_from(messages),
         "questions": {
             "route": {
@@ -231,6 +236,12 @@ def build_request(messages, routes=None):
             }
         },
     }
+
+    decision_model = os.environ.get("LAYA_DECISION_MODEL", "typed-decisions")
+    if decision_model:
+        payload["model"] = decision_model
+
+    return payload
 
 
 def choose(body, routes=None):
@@ -253,19 +264,19 @@ def choose(body, routes=None):
     """
     answer = (body or {}).get("answers", {}).get("route")
     if not isinstance(answer, dict):
-        log.warning("openjev: no route answer in response; falling back")
+        log.warning("laya: no route answer in response; falling back")
         return None
 
     choice = answer.get("choice")
     if choice not in (routes or ROUTES):
-        log.warning("openjev: unknown choice %r; falling back", choice)
+        log.warning("laya: unknown choice %r; falling back", choice)
         return None
 
     # probabilities is an object keyed by option name, not an array.
     probability = (answer.get("probabilities") or {}).get(choice, 0.0)
     if probability < MIN_PROB:
         log.info(
-            "openjev: %s at %.2f is below the %.2f gate; falling back to %s",
+            "laya: %s at %.2f is below the %.2f gate; falling back to %s",
             choice, probability, MIN_PROB, DEFAULT_MODEL,
         )
         return None
@@ -276,6 +287,20 @@ def choose(body, routes=None):
 # One client for the process. A new connection per request would add a TLS or
 # TCP handshake to a decision that is supposed to be the cheap part.
 _client = httpx.AsyncClient(timeout=TIMEOUT_S)
+
+
+def _auth_headers():
+    """Bearer auth headers, if laya is configured to require them.
+
+    laya refuses the request when LAYA_API_KEY is set and the caller does not
+    present it, so the key is forwarded unchanged when it is configured and
+    omitted otherwise. Nothing here reads the key beyond sending it back on the
+    wire.
+    """
+    api_key = os.environ.get("LAYA_API_KEY")
+    if not api_key:
+        return {}
+    return {"Authorization": f"Bearer {api_key}"}
 
 
 async def decide(messages):
@@ -289,15 +314,17 @@ async def decide(messages):
     try:
         routes = await available_routes()
         response = await _client.post(
-            f"{SHIM_URL}/v1/systemone", json=build_request(messages, routes)
+            f"{LAYA_BASE_URL}/v1/systemone",
+            json=build_request(messages, routes),
+            headers=_auth_headers(),
         )
         response.raise_for_status()
         return choose(response.json(), routes) or DEFAULT_MODEL
     except httpx.HTTPError as error:
-        log.warning("openjev: %s; falling back to %s", error, DEFAULT_MODEL)
+        log.warning("laya: %s; falling back to %s", error, DEFAULT_MODEL)
         return DEFAULT_MODEL
     except (ValueError, KeyError, TypeError) as error:
-        log.warning("openjev: malformed response (%s); falling back", error)
+        log.warning("laya: malformed response (%s); falling back", error)
         return DEFAULT_MODEL
 
 
@@ -307,7 +334,7 @@ except ImportError:  # pragma: no cover - lets the logic above be tested alone
     CustomLogger = object
 
 
-class OpenJevRouter(CustomLogger):
+class LayaRouter(CustomLogger):
     """Rewrites `model` before dispatch, so LiteLLM serves the chosen worker.
 
     Registered as a callback, which is the supported way to reach into a
@@ -327,11 +354,11 @@ class OpenJevRouter(CustomLogger):
     """
 
     async def async_pre_call_hook(self, user_api_key_dict, cache, data, call_type):
-        if data.get("model") != os.environ.get("OPENJEV_VIRTUAL_MODEL", "jev-router"):
+        if data.get("model") != os.environ.get("LAYA_VIRTUAL_MODEL", "laya-router"):
             return data
 
         data["model"] = await decide(data.get("messages", []))
         return data
 
 
-proxy_handler_instance = OpenJevRouter()
+proxy_handler_instance = LayaRouter()
