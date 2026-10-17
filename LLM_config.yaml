@@ -65,6 +65,14 @@ model_list:
       base_url: https://xh22rnllkuq2so-8080.proxy.runpod.net/v1
       api_key: os.environ/RUNPOD_API_KEY
 
+  # The decision worker. laya's is_decision probe routes here, and the handler
+  # in decider.py (DecisionWorker, provider "decision") answers with the local
+  # grammar-constrained SLM. No api key: the llama.cpp server does not ask.
+  - model_name: decision
+    litellm_params:
+      model: decision/decision
+      api_key: none
+
   # The virtual model clients ask for. The callback in decider.py intercepts it
   # and rewrites `model` to laya's choice, so these params are only reached if
   # that callback fails to load. They point at laya itself -- not at a worker --
