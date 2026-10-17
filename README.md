@@ -9,10 +9,12 @@ not leave the building.
               │
               ├──► laya :8000   /v1/systemone  ~70–500ms, typed answer
               │
-              └──► laya-direct    answered by the decision model, no LLM
-                   orinth-local     Ornith-1.5-35B-A3B on the laptop
-                   vast-local       the rented GPU, when it is up
-                   haiku │ sonnet │ opus
+              └──► laya-direct      answered by the decision model, no LLM
+                   minicpm5-local     MiniCPM5-2B on the laptop
+                   bonsai-local       Ternary-Bonsai-2-9B on the laptop
+                   ornith-local       Ornith-1.5-35B on the laptop
+                   runpod             Qwen3.8-Flash-Next on the rented GPU
+                   deepseek-flash │ deepseek-v4-pro
 ```
 
 ## Why a decision model rather than a prompt
@@ -82,12 +84,16 @@ LAYA_PORT=8000 LAYA_DEVICE=cpu python laya_runner.py
 #    ...or, on a Python where torch.compile actually imports, the plain path:
 LAYA_PORT=8000 LAYA_DEVICE=cpu laya-serve
 
-# 2) Your local workers, on their own ports
-llama-server -m Ornith-1.5-35B-A3B-Q4_K_M.gguf --port 8003   # the laptop
-# and whatever the rented box is serving, at $VAST_BASE_URL
+# 2) The local llama.cpp server, one OpenAI-compatible endpoint serving the
+#    GGUF checkpoints configured in ~/.config/eca/config.json
+llama-server -m MiniCPM5-2B-Q4_K_M.gguf --port 9080
+# switch checkpoints as needed; all three share :9080
+# llama-server -m Ternary-Bonsai-2-9B-PQ2_0-MTP-Q8_0.gguf --port 9080
+# llama-server -m Ornith-1.5-35B-Q4_K_M.gguf --port 9080
+# and the RunPod pod at the URL in LLM_config.yaml, keyed by $RUNPOD_API_KEY
 
 # 3) The gateway
-ANTHROPIC_API_KEY=... LITELLM_MASTER_KEY=... \
+DEEPSEEK_API_KEY=... RUNPOD_API_KEY=... LITELLM_MASTER_KEY=... \
   PYTHONPATH=. litellm --config LLM_config.yaml --port 4000
 
 # 4) Call it
@@ -133,22 +139,26 @@ before — see below.
 | | Default | |
 |---|---|---|
 | `LAYA_BASE_URL` | `http://localhost:8000` | Where laya serves `/v1/systemone` |
-| `LAYA_DEFAULT_MODEL` | `orinth-local` | Where every fallback goes |
+| `LAYA_DEFAULT_MODEL` | `minicpm5-local` | Where every fallback goes |
 | `LAYA_MIN_PROB` | `0.5` | Mass on the winning option before it is used |
 | `LAYA_TIMEOUT_S` | `1.0` | Hard cap; laya answers in well under it |
 | `LAYA_CONTEXT_CHARS` | `4000` | Tail of the conversation sent as `state` |
 | `LAYA_VIRTUAL_MODEL` | `laya-router` | The name that triggers routing |
 | `LAYA_HEALTH_TTL_S` | `30` | How long a worker health probe is trusted |
 | `LAYA_PROBE_TIMEOUT_S` | `0.3` | Probe cap; must not eat the decision budget |
-| `ORNITH_BASE_URL` | `:8003/v1` | Local laptop worker |
-| `VAST_BASE_URL` | unset | Rented GPU; unset means "not a route" |
+| `LLAMACPP_BASE_URL` | `:9080/v1` | Local llama.cpp server (all three checkpoints) |
+| `RUNPOD_BASE_URL` | the pod proxy | Rented GPU; used by the health probe |
+
+LiteLLM also needs `DEEPSEEK_API_KEY` and `RUNPOD_API_KEY`. `RUNPOD_BASE_URL`
+in this table only drives the health probe; the dispatch URL lives in
+`LLM_config.yaml`, so keep both in step with the pod.
 
 ## Workers that come and go
 
-A rented GPU runs a few hours a day, so which workers exist is a runtime fact,
-not a config-file one. Availability is resolved **before** the question is
-asked: a worker that does not answer a health probe is simply not one of the
-options laya is given.
+A rented GPU runs a few hours a day and the laptop may be closed, so which
+workers exist is a runtime fact, not a config-file one. Availability is resolved
+**before** the question is asked: a worker that does not answer a health probe
+is simply not one of the options laya is given.
 
 That ordering matters more than it looks. Offering a switched-off worker is
 worse than picking the wrong one — the decision comes back confident and

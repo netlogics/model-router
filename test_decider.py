@@ -39,9 +39,12 @@ def choice_response(choice, probabilities, confidence=0.9):
 
 class TestChoose:
     def test_takes_the_named_option(self):
-        body = choice_response("sonnet", {"sonnet": 0.82, "haiku": 0.15, "opus": 0.03})
+        body = choice_response(
+            "deepseek-v4-pro",
+            {"deepseek-v4-pro": 0.82, "deepseek-flash": 0.15, "ornith-local": 0.03},
+        )
 
-        assert decider.choose(body) == "sonnet"
+        assert decider.choose(body) == "deepseek-v4-pro"
 
     def test_the_option_name_is_the_worker_name(self):
         # Nothing maps a label to a model. The criteria keys are the model
@@ -52,16 +55,18 @@ class TestChoose:
             assert decider.choose(body) == worker
 
     def test_falls_back_when_the_winner_is_below_the_gate(self):
-        split = {"sonnet": 0.4, "haiku": 0.35, "opus": 0.25}
+        split = {"deepseek-v4-pro": 0.4, "deepseek-flash": 0.35, "ornith-local": 0.25}
 
-        assert decider.choose(choice_response("sonnet", split)) is None
+        assert decider.choose(choice_response("deepseek-v4-pro", split)) is None
 
     # Confidence and the winner's probability are different numbers. A high
     # confidence on a distribution whose winner is weak must not get through
     # the gate: it is the mass on the option being acted upon that matters.
     def test_a_confident_response_with_a_weak_winner_still_falls_back(self):
         body = choice_response(
-            "sonnet", {"sonnet": 0.4, "haiku": 0.35, "opus": 0.25}, confidence=0.99
+            "deepseek-v4-pro",
+            {"deepseek-v4-pro": 0.4, "deepseek-flash": 0.35, "ornith-local": 0.25},
+            confidence=0.99,
         )
 
         assert decider.choose(body) is None
@@ -79,7 +84,7 @@ class TestChoose:
             # The shape the first version of this file expected. If it ever
             # comes back, it must fall back loudly rather than be mistaken for
             # an answer.
-            {"answers": {"route": {"choices": [{"label": "sonnet", "probability": 0.9}]}}},
+            {"answers": {"route": {"choices": [{"label": "deepseek-v4-pro", "probability": 0.9}]}}},
         ],
     )
     def test_falls_back_on_anything_it_does_not_recognise(self, body):
@@ -187,9 +192,9 @@ class TestAvailability:
     @pytest.mark.asyncio
     async def test_offers_a_local_worker_that_answers(self, monkeypatch):
         _stub_probe(monkeypatch, up=True)
-        monkeypatch.setitem(decider.PROBES, "vast-local", "http://gpu:8000/v1")
+        monkeypatch.setitem(decider.PROBES, "runpod", "http://gpu:8000/v1")
 
-        assert "vast-local" in await decider.available_routes()
+        assert "runpod" in await decider.available_routes()
 
     # The important one. A confident, correct decision to keep a request local
     # is worse than useless if that worker is switched off: dispatch fails and
@@ -197,22 +202,22 @@ class TestAvailability:
     @pytest.mark.asyncio
     async def test_withholds_a_local_worker_that_is_down(self, monkeypatch):
         _stub_probe(monkeypatch, up=False)
-        monkeypatch.setitem(decider.PROBES, "vast-local", "http://gpu:8000/v1")
+        monkeypatch.setitem(decider.PROBES, "runpod", "http://gpu:8000/v1")
 
-        assert "vast-local" not in await decider.available_routes()
+        assert "runpod" not in await decider.available_routes()
 
     @pytest.mark.asyncio
     async def test_treats_an_unconfigured_worker_as_absent(self, monkeypatch):
-        monkeypatch.setitem(decider.PROBES, "vast-local", "")
+        monkeypatch.setitem(decider.PROBES, "runpod", "")
 
-        assert await decider._is_up("vast-local", "") is False
+        assert await decider._is_up("runpod", "") is False
 
     @pytest.mark.asyncio
     async def test_does_not_probe_again_within_the_cache_window(self, monkeypatch):
         probes = _stub_probe(monkeypatch, up=True)
 
-        await decider._is_up("vast-local", "http://gpu:8000/v1")
-        await decider._is_up("vast-local", "http://gpu:8000/v1")
+        await decider._is_up("runpod", "http://gpu:8000/v1")
+        await decider._is_up("runpod", "http://gpu:8000/v1")
 
         assert probes["count"] == 1
 
@@ -223,9 +228,28 @@ class TestAvailability:
         _stub_probe(monkeypatch, up=False)
         routes = await decider.available_routes()
 
-        body = choice_response("vast-local", {"vast-local": 1.0})
+        body = choice_response("runpod", {"runpod": 1.0})
 
         assert decider.choose(body, routes) is None
+
+    @pytest.mark.asyncio
+    async def test_runpod_probe_forwards_the_key(self, monkeypatch):
+        # RunPod's proxy rejects even /models without the token, so the probe
+        # must carry the same bearer key dispatch will use.
+        monkeypatch.setitem(os.environ, "RUNPOD_API_KEY", "pod-key")
+        captured = {}
+
+        class Response:
+            status_code = 200
+
+        async def get(_url, **kwargs):
+            captured.update(kwargs)
+            return Response()
+
+        monkeypatch.setattr(decider._client, "get", get)
+
+        assert await decider._is_up("runpod", "http://gpu:8000/v1") is True
+        assert captured["headers"].get("Authorization") == "Bearer pod-key"
 
 
 class TestDecide:
@@ -240,9 +264,9 @@ class TestDecide:
 
     @pytest.mark.asyncio
     async def test_returns_the_chosen_worker(self, monkeypatch):
-        _stub_post(monkeypatch, json=choice_response("sonnet", {"sonnet": 0.9}))
+        _stub_post(monkeypatch, json=choice_response("deepseek-v4-pro", {"deepseek-v4-pro": 0.9}))
 
-        assert await decider.decide([{"role": "user", "content": "hi"}]) == "sonnet"
+        assert await decider.decide([{"role": "user", "content": "hi"}]) == "deepseek-v4-pro"
 
     @pytest.mark.asyncio
     async def test_fails_open_when_laya_is_unreachable(self, monkeypatch):
@@ -286,7 +310,7 @@ class TestDecide:
                 return None
 
             def json(self):
-                return choice_response("sonnet", {"sonnet": 1.0})
+                return choice_response("deepseek-v4-pro", {"deepseek-v4-pro": 1.0})
 
         async def post(*_args, **_kwargs):
             captured.update(_kwargs)
@@ -294,7 +318,7 @@ class TestDecide:
 
         monkeypatch.setattr(decider._client, "post", post)
 
-        assert await decider.decide([{"role": "user", "content": "hi"}]) == "sonnet"
+        assert await decider.decide([{"role": "user", "content": "hi"}]) == "deepseek-v4-pro"
         assert captured["headers"].get("Authorization") == "Bearer s3cret"
 
     @pytest.mark.asyncio
@@ -309,7 +333,7 @@ class TestDecide:
                 return None
 
             def json(self):
-                return choice_response("sonnet", {"sonnet": 1.0})
+                return choice_response("deepseek-v4-pro", {"deepseek-v4-pro": 1.0})
 
         async def post(*_args, **_kwargs):
             captured.update(_kwargs)
@@ -317,7 +341,7 @@ class TestDecide:
 
         monkeypatch.setattr(decider._client, "post", post)
 
-        assert await decider.decide([{"role": "user", "content": "hi"}]) == "sonnet"
+        assert await decider.decide([{"role": "user", "content": "hi"}]) == "deepseek-v4-pro"
         assert "Authorization" not in captured["headers"]
 
 

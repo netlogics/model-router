@@ -16,42 +16,66 @@
 # =============================================================================
 
 model_list:
-  # Anthropic. Prices are per million tokens, input/output, as of 2026-09.
-  - model_name: haiku            # $1 / $5      200K context
+  # DeepSeek (hosted, OpenAI-compatible at api.deepseek.com). The two tiers are
+  # the only hosted workers: one cheap, one capable. `reasoning_effort` rides
+  # in extra_body so it is forwarded verbatim, matching the ECA provider config.
+  - model_name: deepseek-flash        # fast/cheap, 256K context
     litellm_params:
-      model: anthropic/claude-haiku-4-5
-      api_key: os.environ/ANTHROPIC_API_KEY
+      model: openai/deepseek-flash
+      base_url: https://api.deepseek.com/v1
+      api_key: os.environ/DEEPSEEK_API_KEY
+      extra_body:
+        reasoning_effort: medium
 
-  - model_name: sonnet           # $3 / $15     1M context
-    litellm_params:              # ($2 / $10 introductory through 2026-08-31)
-      model: anthropic/claude-sonnet-5
-      api_key: os.environ/ANTHROPIC_API_KEY
-
-  - model_name: opus             # $5 / $25     1M context
+  - model_name: deepseek-v4-pro       # harder work, 256K context
     litellm_params:
-      model: anthropic/claude-opus-5
-      api_key: os.environ/ANTHROPIC_API_KEY
+      model: openai/deepseek-v4-pro
+      base_url: https://api.deepseek.com/v1
+      api_key: os.environ/DEEPSEEK_API_KEY
+      extra_body:
+        reasoning_effort: medium
 
-  # Self-hosted. Free at the margin, and the only workers that may see data
-  # which must not leave the building.
-  - model_name: ornith-local     # the 4050 box
+  # Self-hosted llama.cpp on the laptop, one OpenAI-compatible server serving
+  # the GGUF checkpoints configured in ~/.config/eca/config.json. These are the
+  # only workers that may see data which must not leave the building.
+  - model_name: minicpm5-local        # 2B, 128K context -- the cheap local
     litellm_params:
-      model: openai/orinth
-      base_url: http://localhost:8003/v1
+      model: openai/MiniCPM5-2B-Q4_K_M.gguf
+      base_url: http://127.0.0.1:9080/v1
       api_key: none
 
-  - model_name: vast-local       # the rented GPU
+  - model_name: bonsai-local          # 9B ternary, 96K context -- mid local
     litellm_params:
-      model: openai/local-large
-      base_url: os.environ/VAST_BASE_URL
-      api_key: os.environ/VAST_API_KEY
+      model: openai/Ternary-Bonsai-2-9B-PQ2_0-MTP-Q8_0.gguf
+      base_url: http://127.0.0.1:9080/v1
+      api_key: none
 
-  # The virtual model clients ask for. Points at haiku so an unrouted request
-  # still answers if the callback fails to load.
+  - model_name: ornith-local          # 35B, 64K context -- the large local
+    litellm_params:
+      model: openai/Ornith-1.5-35B-Q4_K_M.gguf
+      base_url: http://127.0.0.1:9080/v1
+      api_key: none
+
+  # RunPod, the rented GPU. Off-premises but a dedicated instance rather than a
+  # hosted API, so it stays in the self-hosted fallback group. The pod proxy URL
+  # changes when the pod is recreated -- keep it in sync with the ECA config.
+  - model_name: runpod                # Qwen3.8-Flash-Next, 240K context
+    litellm_params:
+      model: openai/Qwen3.8-Flash-Next-UD-Q2_K_XL
+      base_url: https://xh22rnllkuq2so-8080.proxy.runpod.net/v1
+      api_key: os.environ/RUNPOD_API_KEY
+
+  # The virtual model clients ask for. The callback in decider.py intercepts it
+  # and rewrites `model` to laya's choice, so these params are only reached if
+  # that callback fails to load. They point at laya itself -- not at a worker --
+  # because an un-intercepted request must fail closed, not silently leave the
+  # building for a hosted model. Note laya only serves /v1/systemone, so this
+  # fallback will not answer a chat completion; that is deliberate.
   - model_name: laya-router
     litellm_params:
-      model: anthropic/claude-haiku-4-5
-      api_key: os.environ/ANTHROPIC_API_KEY
+      model: openai/laya
+      base_url: http://localhost:8000/v1
+      api_key: none
 
 litellm_settings:
   # This is the supported way to reach a request from a YAML-configured proxy:
@@ -68,13 +92,16 @@ router_settings:
   enable_pre_call_checks: true
   num_retries: 2
   fallbacks:
-    - opus: ["sonnet"]
-    - sonnet: ["haiku"]
-    # A local worker must NOT fall back to a hosted one. The whole reason a
+    - deepseek-v4-pro: ["deepseek-flash"]
+    # A local worker must NOT fall back to a hosted API. The whole reason a
     # request was routed local is that its contents may not leave the building,
-    # and a silent failover would send it anyway.
-    - ornith-local: ["vast-local"]
-    - vast-local: ["orinth-local"]
+    # and a silent failover would send it anyway. RunPod is a dedicated rented
+    # instance, so it is the only acceptable fallback for a local route; the
+    # other local checkpoints are tried when RunPod itself is down.
+    - ornith-local: ["runpod"]
+    - bonsai-local: ["runpod"]
+    - minicpm5-local: ["runpod"]
+    - runpod: ["minicpm5-local"]
 
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
@@ -91,11 +118,11 @@ general_settings:
 #       model: auto_router/complexity_router
 #       complexity_router_config:
 #         tiers:
-#           SIMPLE:    haiku
-#           MEDIUM:    sonnet
-#           COMPLEX:   sonnet
-#           REASONING: opus
-#     complexity_router_default_model: haiku
+#           SIMPLE:    deepseek-flash
+#           MEDIUM:    deepseek-flash
+#           COMPLEX:   deepseek-v4-pro
+#           REASONING: deepseek-v4-pro
+#     complexity_router_default_model: deepseek-flash
 #
 # Reasons to keep the hook anyway, all of them about control rather than
 # capability:
