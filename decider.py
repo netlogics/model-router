@@ -29,6 +29,14 @@ log = logging.getLogger(__name__)
 LAYA_BASE_URL = os.environ.get("LAYA_BASE_URL", "http://localhost:8000")
 DEFAULT_MODEL = os.environ.get("LAYA_DEFAULT_MODEL", "minicpm5-local")
 
+# The worker that answers decision-shaped requests itself (the grammar-
+# constrained local SLM), selected when laya's is_decision probe fires.
+DECISION_WORKER = os.environ.get("LAYA_DECISION_WORKER", "decision")
+
+# Probability mass on `true` before the is_decision probe is believed. laya
+# reports a noul answer as P(true), so this is the natural 0.5 gate.
+DECISION_PROB = float(os.environ.get("LAYA_DECISION_PROB", "0.5"))
+
 # Minimum probability mass on the winning option before the decision is used.
 # This is the winner's own probability, not laya's `confidence` -- see
 # choose() for why the two are not interchangeable.
@@ -239,9 +247,10 @@ def _text_of(content):
 def build_request(messages, routes=None):
     """The /v1/systemone payload for one routing decision.
 
-    One question, not two. An extra question is an extra distribution to read
-    on every request, and a "how complex is this?" score that nothing consumes
-    is latency with no consumer.
+    Two questions, answered in a single forward pass: `route` (which worker)
+    and `is_decision` (whether this request is itself a decision the decision
+    worker should answer directly). The probe costs no extra round trip because
+    laya reads every question in the payload at once.
 
     `routes` is the currently-serving subset -- see available_routes().
 
@@ -263,7 +272,15 @@ def build_request(messages, routes=None):
                     "should not leave the building."
                 ),
                 "criteria": routes or ROUTES,
-            }
+            },
+            "is_decision": {
+                "type": "noul",
+                "instructions": (
+                    "Is this request itself a decision with a fixed answer "
+                    "space -- classify, yes/no, score, or pick one of a set "
+                    "of options -- rather than a request to generate prose?"
+                ),
+            },
         },
     }
 
@@ -314,6 +331,27 @@ def choose(body, routes=None):
     return choice
 
 
+def is_decision(body, threshold=DECISION_PROB):
+    """Whether laya's is_decision probe says the request is itself a decision.
+
+    A noul answer carries the probability mass on `true` in a field named
+    `noul` -- there is no `choice` or `probabilities` for noul. The request is
+    treated as a decision when that mass meets the threshold. Anything missing
+    or malformed is treated as prose, which is the safe default: it routes to
+    an LLM rather than the decision worker.
+    """
+    answer = (body or {}).get("answers", {}).get("is_decision")
+    if not isinstance(answer, dict):
+        return False
+
+    prob_true = answer.get("noul")
+    if not isinstance(prob_true, (int, float)):
+        log.warning("laya: malformed is_decision answer; treating as prose")
+        return False
+
+    return prob_true >= threshold
+
+
 # One client for the process. A new connection per request would add a TLS or
 # TCP handshake to a decision that is supposed to be the cheap part.
 _client = httpx.AsyncClient(timeout=TIMEOUT_S)
@@ -349,7 +387,10 @@ async def decide(messages):
             headers=_auth_headers(),
         )
         response.raise_for_status()
-        return choose(response.json(), routes) or DEFAULT_MODEL
+        body = response.json()
+        if is_decision(body):
+            return DECISION_WORKER
+        return choose(body, routes) or DEFAULT_MODEL
     except httpx.HTTPError as error:
         log.warning("laya: %s; falling back to %s", error, DEFAULT_MODEL)
         return DEFAULT_MODEL
