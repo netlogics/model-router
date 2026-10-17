@@ -386,6 +386,53 @@ class TestDecide:
         assert "Authorization" not in captured["headers"]
 
 
+class TestDecisionWorker:
+    def test_parse_choice(self):
+        decision = decider.parse_decision(
+            '{"type": "choice", "criteria": {"cat": "small", "dog": "large"}, "answer": "dog"}'
+        )
+
+        assert decision["answer"] == "dog"
+
+    def test_parse_score(self):
+        decision = decider.parse_decision(
+            '{"type": "score", "criteria": ["low", "high"], "answer": 1}'
+        )
+
+        assert decision["answer"] == 1
+
+    def test_parse_noul_normalises_a_boolean(self):
+        decision = decider.parse_decision('{"type": "noul", "answer": "true"}')
+
+        assert decision["answer"] is True
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "not json",
+            '{"type": "chat"}',  # unknown type
+            '{"type": "choice", "answer": "x"}',  # no criteria
+            '{"type": "choice", "criteria": {"a": "b"}, "answer": "z"}',  # answer not in criteria
+            '{"type": "score", "criteria": ["a"], "answer": 5}',  # out of range
+            '{"type": "noul", "answer": "maybe"}',  # not a boolean
+        ],
+    )
+    def test_parse_rejects_malformed(self, text):
+        with pytest.raises(ValueError):
+            decider.parse_decision(text)
+
+    def test_payload_constrains_the_grammar(self):
+        payload = decider.decision_payload("which is bigger, a cat or a dog?")
+
+        assert payload["response_format"]["type"] == "json_schema"
+        assert payload["messages"][0]["content"] == "which is bigger, a cat or a dog?"
+
+    def test_format_decision_is_json(self):
+        assert decider.format_decision({"type": "noul", "answer": True}) == (
+            '{"type": "noul", "answer": true}'
+        )
+
+
 def _stub_probe(monkeypatch, up):
     """Stub the health probe. Returns a dict whose "count" tracks calls."""
     probes = {"count": 0}
