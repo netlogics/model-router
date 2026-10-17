@@ -37,6 +37,23 @@ def choice_response(choice, probabilities, confidence=0.9):
     }
 
 
+def noul_response(prob_true, confidence=0.9):
+    """A /v1/systemone noul answer, in the documented shape.
+
+    noul carries P(true) directly -- there is no `choice` or `probabilities`
+    key for a noul question.
+    """
+    return {
+        "answers": {
+            "is_decision": {
+                "type": "noul",
+                "noul": prob_true,
+                "confidence": confidence,
+            }
+        }
+    }
+
+
 class TestChoose:
     def test_takes_the_named_option(self):
         body = choice_response(
@@ -128,11 +145,17 @@ class TestContext:
 
 
 class TestRequest:
-    def test_asks_one_question(self):
-        # An unused second question is a second distribution read on every
-        # request. The first version asked for a complexity score and threw it
-        # away.
-        assert list(build_questions()) == ["route"]
+    def test_asks_two_questions(self):
+        # One routing question plus the is_decision probe, both answered in a
+        # single forward pass. The probe is consumed, so it is not the unused
+        # second question the first version threw away.
+        assert list(build_questions()) == ["route", "is_decision"]
+
+    def test_is_decision_is_a_noul_probe(self):
+        probe = build_questions()["is_decision"]
+
+        assert probe["type"] == "noul"
+        assert probe["instructions"]
 
     def test_gives_every_option_a_description(self):
         # laya reads the criteria to learn what the options mean. Bare model
@@ -267,6 +290,24 @@ class TestDecide:
         _stub_post(monkeypatch, json=choice_response("deepseek-v4-pro", {"deepseek-v4-pro": 0.9}))
 
         assert await decider.decide([{"role": "user", "content": "hi"}]) == "deepseek-v4-pro"
+
+    @pytest.mark.asyncio
+    async def test_routes_a_decision_to_the_decision_worker(self, monkeypatch):
+        _stub_post(monkeypatch, json=noul_response(0.9))
+
+        assert await decider.decide([{"role": "user", "content": "classify this"}]) == decider.DECISION_WORKER
+
+    @pytest.mark.asyncio
+    async def test_a_prose_request_below_the_threshold_routes_to_an_llm(self, monkeypatch):
+        body = {
+            "answers": {
+                "is_decision": noul_response(0.4)["answers"]["is_decision"],
+                "route": choice_response("deepseek-flash", {"deepseek-flash": 0.9})["answers"]["route"],
+            }
+        }
+        _stub_post(monkeypatch, json=body)
+
+        assert await decider.decide([{"role": "user", "content": "write me an email"}]) == "deepseek-flash"
 
     @pytest.mark.asyncio
     async def test_fails_open_when_laya_is_unreachable(self, monkeypatch):
