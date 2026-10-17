@@ -34,7 +34,7 @@ model_list:
 
   # Self-hosted. Free at the margin, and the only workers that may see data
   # which must not leave the building.
-  - model_name: orinth-local     # the 4050 box
+  - model_name: ornith-local     # the 4050 box
     litellm_params:
       model: openai/orinth
       base_url: http://localhost:8003/v1
@@ -73,7 +73,7 @@ router_settings:
     # A local worker must NOT fall back to a hosted one. The whole reason a
     # request was routed local is that its contents may not leave the building,
     # and a silent failover would send it anyway.
-    - orinth-local: ["vast-local"]
+    - ornith-local: ["vast-local"]
     - vast-local: ["orinth-local"]
 
 general_settings:
