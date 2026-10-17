@@ -27,7 +27,7 @@ import httpx
 log = logging.getLogger(__name__)
 
 LAYA_BASE_URL = os.environ.get("LAYA_BASE_URL", "http://localhost:8000")
-DEFAULT_MODEL = os.environ.get("LAYA_DEFAULT_MODEL", "orinth-local")
+DEFAULT_MODEL = os.environ.get("LAYA_DEFAULT_MODEL", "minicpm5-local")
 
 # Minimum probability mass on the winning option before the decision is used.
 # This is the winner's own probability, not laya's `confidence` -- see
@@ -69,27 +69,34 @@ ROUTES = {
         "this violate a policy. Anything answerable by choosing a label rather "
         "than by writing prose."
     ),
-    "orinth-local": (
-        "Simple requests that must not leave the building, or that a small "
-        "local model can finish: short factual answers, reformatting, "
-        "extraction, boilerplate. Also anything containing personal or customer "
-        "data, credentials, or internal source."
+    "minicpm5-local": (
+        "The smallest local worker: simple requests that must not leave the "
+        "building, or that a 2B model can finish -- short factual answers, "
+        "reformatting, extraction, boilerplate. Also anything containing "
+        "personal or customer data, credentials, or internal source."
     ),
-    "vast-local": (
+    "bonsai-local": (
+        "Local work a step beyond the smallest model: moderate reformatting, "
+        "summarising an internal document, simple code, or extraction that "
+        "needs a little more capacity, still with data that must not leave the "
+        "building."
+    ),
+    "ornith-local": (
         "Substantial work that must still stay self-hosted: longer code, "
         "multi-file reasoning, or analysis over internal documents that cannot "
         "be sent to a third party."
     ),
-    "haiku": (
+    "runpod": (
+        "Substantial work that may use the rented GPU: longer code, multi-file "
+        "reasoning, or analysis too large for the laptop but not appropriate "
+        "for a hosted API."
+    ),
+    "deepseek-flash": (
         "Ordinary requests with no privacy constraint: summarising, short "
         "answers, chat, straightforward code, drafting."
     ),
-    "sonnet": (
-        "Harder requests: multi-step reasoning, non-trivial code, longer "
-        "analysis, ambiguous instructions needing interpretation."
-    ),
-    "opus": (
-        "The hardest requests only: deep multi-step reasoning, large refactors, "
+    "deepseek-v4-pro": (
+        "The hardest requests: deep multi-step reasoning, large refactors, "
         "long-horizon agentic work, problems where a wrong answer is expensive."
     ),
 }
@@ -97,16 +104,37 @@ ROUTES = {
 
 # Hosted routes, plus the decision model itself, which is up whenever this hook
 # is running. LiteLLM owns retries and failover for these.
-ALWAYS_UP = ("laya-direct", "haiku", "sonnet", "opus")
+ALWAYS_UP = ("laya-direct", "deepseek-flash", "deepseek-v4-pro")
 
 # Self-hosted routes, and where to probe them. A rented GPU is up for part of
-# the day; a laptop is up when it is open.
+# the day; a laptop is up when it is open. All three local checkpoints live on
+# the one llama.cpp server, so they share a URL and probe it independently.
+LLAMACPP_BASE_URL = os.environ.get("LLAMACPP_BASE_URL", "http://127.0.0.1:9080/v1")
+RUNPOD_BASE_URL = os.environ.get(
+    "RUNPOD_BASE_URL", "https://xh22rnllkuq2so-8080.proxy.runpod.net/v1"
+)
+
 PROBES = {
-    "orinth-local": os.environ.get("ORNITH_BASE_URL", "http://localhost:8003/v1"),
-    "vast-local": os.environ.get("VAST_BASE_URL", ""),
+    "minicpm5-local": LLAMACPP_BASE_URL,
+    "bonsai-local": LLAMACPP_BASE_URL,
+    "ornith-local": LLAMACPP_BASE_URL,
+    "runpod": RUNPOD_BASE_URL,
 }
 
 _health = {}  # route -> (checked_at, is_up)
+
+
+def _probe_headers(route):
+    """Auth for a probe, if the worker needs it.
+
+    RunPod's proxy rejects even /models without the key, so the probe carries
+    the same bearer token dispatch will use. The local llama.cpp server does
+    not ask for one.
+    """
+    if route != "runpod":
+        return {}
+    api_key = os.environ.get("RUNPOD_API_KEY")
+    return {"Authorization": f"Bearer {api_key}"} if api_key else {}
 
 
 async def available_routes():
@@ -148,7 +176,9 @@ async def _is_up(route, base_url):
 
     try:
         response = await _client.get(
-            f"{base_url.rstrip('/')}/models", timeout=PROBE_TIMEOUT_S
+            f"{base_url.rstrip('/')}/models",
+            timeout=PROBE_TIMEOUT_S,
+            headers=_probe_headers(route),
         )
         is_up = response.status_code < 400
     except httpx.HTTPError:
