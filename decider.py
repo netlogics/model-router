@@ -18,6 +18,7 @@ LAYA_PORT (default 8000), so there is no shim in front of it:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -36,6 +37,13 @@ DECISION_WORKER = os.environ.get("LAYA_DECISION_WORKER", "decision")
 # Probability mass on `true` before the is_decision probe is believed. laya
 # reports a noul answer as P(true), so this is the natural 0.5 gate.
 DECISION_PROB = float(os.environ.get("LAYA_DECISION_PROB", "0.5"))
+
+# The local llama.cpp checkpoint the decision worker prompts for structured
+# decisions, and how long that generation may take.
+DECISION_SLM_MODEL = os.environ.get(
+    "LAYA_DECISION_SLM_MODEL", "MiniCPM5-2B-Q4_K_M.gguf"
+)
+DECISION_SLM_TIMEOUT_S = float(os.environ.get("LAYA_DECISION_SLM_TIMEOUT_S", "30"))
 
 # Minimum probability mass on the winning option before the decision is used.
 # This is the winner's own probability, not laya's `confidence` -- see
@@ -352,6 +360,91 @@ def is_decision(body, threshold=DECISION_PROB):
     return prob_true >= threshold
 
 
+# The shape the decision SLM must emit. llama.cpp enforces this grammar via
+# `response_format: json_schema`, so the SLM cannot go off-schema: there is no
+# free-text parse step to fail, only a schema to validate.
+DECISION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "type": {"type": "string", "enum": ["choice", "score", "noul"]},
+        "criteria": {"type": ["object", "array", "null"]},
+        "answer": {"type": ["string", "number", "boolean", "null"]},
+    },
+    "required": ["type", "answer"],
+    "additionalProperties": False,
+}
+
+DECISION_TYPES = ("choice", "score", "noul")
+
+
+def decision_payload(prompt, model=None):
+    """The llama.cpp chat request that extracts a structured decision."""
+    return {
+        "model": model or DECISION_SLM_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {"name": "decision", "schema": DECISION_SCHEMA},
+        },
+    }
+
+
+def parse_decision(text):
+    """Validate the SLM's JSON decision, or raise ValueError.
+
+    The grammar guarantees valid JSON of the schema above; this adds the
+    semantic checks the schema cannot express:
+
+    - choice: `criteria` is an object, `answer` is one of its keys.
+    - score:  `criteria` is an array, `answer` is a number within its range.
+    - noul:   `answer` is a boolean (normalised from "true"/"false"/0/1).
+    """
+    try:
+        decision = json.loads(text)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"decision worker returned invalid JSON: {error}") from error
+
+    if not isinstance(decision, dict):
+        raise ValueError("decision worker returned a non-object")
+
+    dtype = decision.get("type")
+    if dtype not in DECISION_TYPES:
+        raise ValueError(f"decision worker returned unknown type {dtype!r}")
+
+    answer = decision.get("answer")
+    criteria = decision.get("criteria")
+
+    if dtype == "choice":
+        if not isinstance(criteria, dict) or not criteria:
+            raise ValueError("choice decision must carry a non-empty criteria object")
+        if answer not in criteria:
+            raise ValueError(f"choice answer {answer!r} is not one of the criteria")
+    elif dtype == "score":
+        if not isinstance(criteria, list) or not criteria:
+            raise ValueError("score decision must carry a non-empty criteria list")
+        if not isinstance(answer, (int, float)):
+            raise ValueError("score answer must be a number")
+        if not 0 <= answer < len(criteria):
+            raise ValueError(f"score answer {answer!r} is out of range")
+    else:  # noul
+        if isinstance(answer, bool):
+            pass
+        elif answer in (0, 1):
+            decision["answer"] = bool(answer)
+        elif isinstance(answer, str) and answer.lower() in ("true", "false"):
+            decision["answer"] = answer.lower() == "true"
+        else:
+            raise ValueError(f"noul answer must be a boolean, got {answer!r}")
+
+    return decision
+
+
+def format_decision(decision):
+    """The assistant message content handed back to the client."""
+    return json.dumps(decision)
+
+
 # One client for the process. A new connection per request would add a TLS or
 # TCP handshake to a decision that is supposed to be the cheap part.
 _client = httpx.AsyncClient(timeout=TIMEOUT_S)
@@ -400,9 +493,15 @@ async def decide(messages):
 
 
 try:
+    import litellm as _litellm
     from litellm.integrations.custom_logger import CustomLogger
+    from litellm.llms.custom_llm import CustomLLM
+    from litellm.types.utils import Choices, Message, ModelResponse
 except ImportError:  # pragma: no cover - lets the logic above be tested alone
+    _litellm = None
     CustomLogger = object
+    CustomLLM = object
+    Choices = Message = ModelResponse = None
 
 
 class LayaRouter(CustomLogger):
@@ -433,3 +532,105 @@ class LayaRouter(CustomLogger):
 
 
 proxy_handler_instance = LayaRouter()
+
+
+# --- decision worker -------------------------------------------------------
+
+# One blocking client for the SLM call. The proxy is async, so acompletion()
+# runs this in a worker thread; completion() uses it directly.
+_slm_client = httpx.Client(timeout=DECISION_SLM_TIMEOUT_S)
+
+
+def _decide_with_slm_sync(messages):
+    """Ask the local SLM to answer a decision prompt; returns assistant text.
+
+    Raises httpx.HTTPError or ValueError on failure -- the decision worker fails
+    loudly rather than returning a wrong answer.
+    """
+    prompt = context_from(messages)
+    response = _slm_client.post(
+        f"{LLAMACPP_BASE_URL.rstrip('/')}/chat/completions",
+        json=decision_payload(prompt),
+    )
+    response.raise_for_status()
+    content = response.json()["choices"][0]["message"]["content"]
+    return format_decision(parse_decision(content))
+
+
+async def _decide_with_slm(messages):
+    """Async wrapper so acompletion() does not block the event loop."""
+    import asyncio
+
+    return await asyncio.to_thread(_decide_with_slm_sync, messages)
+
+
+def _model_response(model_response, content):
+    """Fill a LiteLLM ModelResponse with one assistant message."""
+    if ModelResponse is None:  # pragma: no cover - litellm missing
+        raise RuntimeError("litellm is required to serve the decision worker")
+    model_response.choices = [
+        Choices(message=Message(content=content, role="assistant"), finish_reason="stop")
+    ]
+    return model_response
+
+
+class DecisionWorker(CustomLLM):
+    """A LiteLLM CustomLLM that answers decision prompts with the local SLM.
+
+    Registered under the provider name "decision", so model_list references it
+    as `model: decision/decision`. decision_payload() constrains the SLM to a
+    fixed JSON shape, and parse_decision() validates it, so the worker never
+    hands a malformed decision back to the caller.
+    """
+
+    def completion(
+        self,
+        model,
+        messages,
+        api_base,
+        custom_prompt_dict,
+        model_response,
+        print_verbose,
+        encoding,
+        api_key,
+        logging_obj,
+        optional_params,
+        acompletion=None,
+        litellm_params=None,
+        logger_fn=None,
+        headers=None,
+        timeout=None,
+        client=None,
+    ):
+        content = _decide_with_slm_sync(messages)
+        return _model_response(model_response, content)
+
+    async def acompletion(
+        self,
+        model,
+        messages,
+        api_base,
+        custom_prompt_dict,
+        model_response,
+        print_verbose,
+        encoding,
+        api_key,
+        logging_obj,
+        optional_params,
+        acompletion=None,
+        litellm_params=None,
+        logger_fn=None,
+        headers=None,
+        timeout=None,
+        client=None,
+    ):
+        content = await _decide_with_slm(messages)
+        return _model_response(model_response, content)
+
+
+_decision_worker_instance = None
+if _litellm is not None:
+    _decision_worker_instance = DecisionWorker()
+    _litellm.custom_provider_map.append(
+        {"provider": "decision", "custom_handler": _decision_worker_instance}
+    )
