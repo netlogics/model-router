@@ -82,18 +82,6 @@ HEALTH_TTL_S = float(os.environ.get("LAYA_HEALTH_TTL_S", "30"))
 # criteria to understand what each option means. Passing bare model names with
 # no description asks it to route on the strings "gpt-4o" and "gpt-4o-mini".
 ROUTES = {
-    # The cheapest possible outcome: the request *is* a decision, so laya
-    # answers it and no LLM is called at all. Classification, yes/no, scoring,
-    # ranking, guardrail checks, picking one option from a fixed set. Routing
-    # is only one instance of this shape -- the model is a general typed-answer
-    # engine, and every request served here costs a forward pass instead of a
-    # per-token bill.
-    "laya-direct": (
-        "The request is itself a decision with a fixed answer space: classify "
-        "this, is this X yes or no, score this, pick one of these options, does "
-        "this violate a policy. Anything answerable by choosing a label rather "
-        "than by writing prose."
-    ),
     "minicpm5-local": (
         "The smallest local worker: simple requests that must not leave the "
         "building, or that a 2B model can finish -- short factual answers, "
@@ -127,9 +115,9 @@ ROUTES = {
 }
 
 
-# Hosted routes, plus the decision model itself, which is up whenever this hook
-# is running. LiteLLM owns retries and failover for these.
-ALWAYS_UP = ("laya-direct", "deepseek-flash", "deepseek-v4-pro")
+# Hosted routes. LiteLLM owns retries and failover for these. The decision
+# worker is not a route option: the is_decision probe selects it directly.
+ALWAYS_UP = ("deepseek-flash", "deepseek-v4-pro")
 
 # Self-hosted routes, and where to probe them. A rented GPU is up for part of
 # the day; a laptop is up when it is open. All three local checkpoints live on
