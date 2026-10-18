@@ -12,6 +12,7 @@ choose() is tested against them directly. No network, no litellm, no server.
     pytest
 """
 
+import json
 import os
 
 import pytest
@@ -386,6 +387,40 @@ class TestDecide:
         assert "Authorization" not in captured["headers"]
 
 
+class TestIsDecision:
+    """The noul probe: whether a request is itself a decision."""
+
+    def test_true_above_the_threshold(self):
+        assert decider.is_decision(noul_response(0.9)) is True
+
+    def test_false_below_the_threshold(self):
+        assert decider.is_decision(noul_response(0.4)) is False
+
+    def test_uses_the_given_threshold(self):
+        assert decider.is_decision(noul_response(0.6), threshold=0.7) is False
+        assert decider.is_decision(noul_response(0.6), threshold=0.5) is True
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            {},
+            None,
+            {"answers": {}},
+            {"answers": {"is_decision": None}},
+            # A noul answer has no `choice` or `probabilities`; a choice-shaped
+            # answer is prose, not a decision, and must be treated as such.
+            {"answers": {"is_decision": {"type": "choice", "choice": "x"}}},
+        ],
+    )
+    def test_missing_or_malformed_is_treated_as_prose(self, body):
+        assert decider.is_decision(body) is False
+
+    def test_a_non_numeric_noul_is_treated_as_prose(self):
+        body = {"answers": {"is_decision": {"type": "noul", "noul": "yes"}}}
+
+        assert decider.is_decision(body) is False
+
+
 class TestDecisionWorker:
     def test_parse_choice(self):
         decision = decider.parse_decision(
@@ -616,6 +651,164 @@ class TestDecisionScorer:
         )
 
         assert scored["calibrated"] is True
+
+
+class TestDecisionWorkerDispatch:
+    """The CustomLLM's response conversion, exercised without litellm."""
+
+    def test_model_response_carries_one_assistant_message(self, monkeypatch):
+        captured = _fake_litellm_types(monkeypatch)
+
+        response = decider.ModelResponse()
+        result = decider._model_response(response, "hello")
+
+        assert result is response
+        assert captured["message"] == {"content": "hello", "role": "assistant"}
+        assert captured["choices"]["finish_reason"] == "stop"
+
+    def test_model_response_fails_loudly_without_litellm(self, monkeypatch):
+        monkeypatch.setattr(decider, "ModelResponse", None)
+
+        with pytest.raises(RuntimeError):
+            decider._model_response(object(), "hello")
+
+    def test_completion_returns_the_parsed_decision(self, monkeypatch):
+        captured = _fake_litellm_types(monkeypatch)
+        _stub_slm(monkeypatch, '{"type": "noul", "answer": true}')
+
+        decider.DecisionWorker().completion(
+            model="decision/decision",
+            messages=[{"role": "user", "content": "is this spam?"}],
+            api_base=None,
+            custom_prompt_dict=None,
+            model_response=decider.ModelResponse(),
+            print_verbose=None,
+            encoding=None,
+            api_key=None,
+            logging_obj=None,
+            optional_params=None,
+        )
+
+        assert captured["message"]["content"] == '{"type": "noul", "answer": true}'
+
+    @pytest.mark.asyncio
+    async def test_acompletion_returns_the_parsed_decision(self, monkeypatch):
+        captured = _fake_litellm_types(monkeypatch)
+        _stub_slm(monkeypatch, '{"type": "score", "criteria": ["low", "high"], "answer": 1}')
+
+        await decider.DecisionWorker().acompletion(
+            model="decision/decision",
+            messages=[{"role": "user", "content": "how bad is it?"}],
+            api_base=None,
+            custom_prompt_dict=None,
+            model_response=decider.ModelResponse(),
+            print_verbose=None,
+            encoding=None,
+            api_key=None,
+            logging_obj=None,
+            optional_params=None,
+        )
+
+        assert json.loads(captured["message"]["content"])["answer"] == 1
+
+    def test_completion_does_not_score_by_default(self, monkeypatch):
+        captured = _fake_litellm_types(monkeypatch)
+        _stub_slm(monkeypatch, '{"type": "choice", "criteria": {"a": "x"}, "answer": "a"}')
+        monkeypatch.setattr(decider, "DECISION_SCORE", False)
+
+        decider.DecisionWorker().completion(
+            model="decision/decision",
+            messages=[{"role": "user", "content": "a or b?"}],
+            api_base=None,
+            custom_prompt_dict=None,
+            model_response=decider.ModelResponse(),
+            print_verbose=None,
+            encoding=None,
+            api_key=None,
+            logging_obj=None,
+            optional_params=None,
+        )
+
+        assert "calibrated" not in json.loads(captured["message"]["content"])
+
+    def test_completion_scores_when_requested(self, monkeypatch):
+        captured = _fake_litellm_types(monkeypatch)
+        _stub_slm(
+            monkeypatch,
+            '{"type": "choice", "criteria": {"a": "x", "b": "y"}, "answer": "a"}',
+        )
+
+        class LayaResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "answers": {
+                        "decision": {
+                            "type": "choice",
+                            "probabilities": {"a": 0.9, "b": 0.1},
+                        }
+                    }
+                }
+
+        monkeypatch.setattr(
+            decider._laya_sync_client, "post", lambda *_a, **_k: LayaResponse()
+        )
+
+        decider.DecisionWorker().completion(
+            model="decision/decision",
+            messages=[{"role": "user", "content": "a or b?"}],
+            api_base=None,
+            custom_prompt_dict=None,
+            model_response=decider.ModelResponse(),
+            print_verbose=None,
+            encoding=None,
+            api_key=None,
+            logging_obj=None,
+            optional_params={"decision_score": True},
+        )
+
+        result = json.loads(captured["message"]["content"])
+        assert result["calibrated"] is True
+        assert result["calibrated_probabilities"] == {"a": 0.9, "b": 0.1}
+
+
+def _fake_litellm_types(monkeypatch):
+    """Fake the litellm types so the worker's response conversion is testable.
+
+    Returns a dict where the converted assistant message is captured under
+    "message" and the Choices kwargs under "choices".
+    """
+    captured = {}
+
+    class Message:
+        def __init__(self, **kwargs):
+            captured["message"] = kwargs
+
+    class Choices:
+        def __init__(self, **kwargs):
+            captured["choices"] = kwargs
+
+    class ModelResponse:
+        pass
+
+    monkeypatch.setattr(decider, "Message", Message)
+    monkeypatch.setattr(decider, "Choices", Choices)
+    monkeypatch.setattr(decider, "ModelResponse", ModelResponse)
+    return captured
+
+
+def _stub_slm(monkeypatch, content):
+    """Stub the SLM client to return one assistant message with `content`."""
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": [{"message": {"content": content}}]}
+
+    monkeypatch.setattr(decider._slm_client, "post", lambda *_a, **_k: Response())
 
 
 def _stub_probe(monkeypatch, up):
