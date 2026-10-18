@@ -433,6 +433,191 @@ class TestDecisionWorker:
         )
 
 
+class TestDecisionScorer:
+    """The opt-in laya re-score hop on top of the SLM's decision."""
+
+    def test_request_reasks_type_and_criteria_without_the_answer(self):
+        decision = {
+            "type": "choice",
+            "criteria": {"cat": "small", "dog": "large"},
+            "answer": "dog",
+        }
+
+        payload = decider.decision_score_request(
+            [{"role": "user", "content": "which is bigger?"}], decision
+        )
+
+        question = payload["questions"]["decision"]
+        assert question["type"] == "choice"
+        assert question["criteria"] == {"cat": "small", "dog": "large"}
+        assert "answer" not in question
+        assert payload["state"] == "which is bigger?"
+
+    def test_request_carries_the_decision_model(self, monkeypatch):
+        monkeypatch.delenv("LAYA_DECISION_MODEL", raising=False)
+        decision = {"type": "noul", "answer": True}
+
+        payload = decider.decision_score_request(
+            [{"role": "user", "content": "x"}], decision
+        )
+
+        assert payload["model"] == "typed-decisions"
+
+    def test_request_omits_noul_criteria(self):
+        # A noul's answer space is the fixed {true, false} pair; its criteria
+        # is not part of the extracted decision and must not be forwarded.
+        decision = {"type": "noul", "answer": True, "criteria": {"true": "yes"}}
+
+        payload = decider.decision_score_request(
+            [{"role": "user", "content": "x"}], decision
+        )
+
+        assert "criteria" not in payload["questions"]["decision"]
+
+    def test_apply_score_attaches_calibrated_probabilities(self):
+        decision = {
+            "type": "choice",
+            "criteria": {"cat": "small", "dog": "large"},
+            "answer": "dog",
+        }
+        laya = {"type": "choice", "choice": "dog", "probabilities": {"cat": 0.3, "dog": 0.7}}
+
+        scored = decider._apply_score(decision, laya)
+
+        assert scored["calibrated"] is True
+        assert scored["calibrated_probabilities"] == {"cat": 0.3, "dog": 0.7}
+        assert scored["answer"] == "dog"  # the SLM's choice, not laya's
+
+    def test_apply_score_degrades_below_the_gate(self):
+        decision = {
+            "type": "choice",
+            "criteria": {"cat": "small", "dog": "large"},
+            "answer": "dog",
+        }
+        laya = {"type": "choice", "choice": "cat", "probabilities": {"cat": 0.6, "dog": 0.4}}
+
+        scored = decider._apply_score(decision, laya)
+
+        assert scored["calibrated"] is False
+        assert "note" in scored
+        assert scored["answer"] == "dog"
+
+    def test_apply_score_handles_a_score_decision(self):
+        decision = {"type": "score", "criteria": ["low", "high"], "answer": 1}
+        laya = {"type": "score", "score": 1, "probabilities": {"0": 0.2, "1": 0.8}}
+
+        scored = decider._apply_score(decision, laya)
+
+        assert scored["calibrated"] is True
+        assert scored["calibrated_probabilities"]["1"] == 0.8
+
+    def test_apply_score_handles_a_noul_decision(self):
+        decision = {"type": "noul", "answer": True}
+        laya = {"type": "noul", "noul": 0.9}
+
+        scored = decider._apply_score(decision, laya)
+
+        assert scored["calibrated"] is True
+        assert scored["calibrated_probabilities"] == {"true": 0.9, "false": 0.1}
+
+    def test_apply_score_degrades_on_a_malformed_laya_answer(self):
+        decision = {"type": "noul", "answer": True}
+
+        scored = decider._apply_score(decision, {})
+
+        assert scored["calibrated"] is False
+        assert "note" in scored
+
+    def test_score_enabled_is_off_by_default(self, monkeypatch):
+        monkeypatch.setattr(decider, "DECISION_SCORE", False)
+
+        assert decider._score_enabled({}) is False
+        assert decider._score_enabled(None) is False
+
+    def test_score_enabled_from_the_env_default(self, monkeypatch):
+        monkeypatch.setattr(decider, "DECISION_SCORE", True)
+
+        assert decider._score_enabled({}) is True
+
+    def test_score_enabled_per_request_flag_wins(self, monkeypatch):
+        monkeypatch.setattr(decider, "DECISION_SCORE", False)
+
+        assert decider._score_enabled({"decision_score": True}) is True
+        assert decider._score_enabled({"decision_score": False}) is False
+
+    def test_score_with_laya_sync_enriches_on_success(self, monkeypatch):
+        decision = {"type": "choice", "criteria": {"a": "x", "b": "y"}, "answer": "a"}
+
+        class Response:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "answers": {
+                        "decision": {
+                            "type": "choice",
+                            "probabilities": {"a": 0.9, "b": 0.1},
+                        }
+                    }
+                }
+
+        monkeypatch.setattr(decider._laya_sync_client, "post", lambda *_a, **_k: Response())
+
+        scored = decider._score_with_laya_sync(
+            [{"role": "user", "content": "q"}], decision
+        )
+
+        assert scored["calibrated"] is True
+
+    def test_score_with_laya_sync_degrades_on_error(self, monkeypatch):
+        import httpx
+
+        decision = {"type": "choice", "criteria": {"a": "x"}, "answer": "a"}
+
+        def refuse(*_a, **_k):
+            raise httpx.ConnectError("down")
+
+        monkeypatch.setattr(decider._laya_sync_client, "post", refuse)
+
+        scored = decider._score_with_laya_sync(
+            [{"role": "user", "content": "q"}], decision
+        )
+
+        assert scored["calibrated"] is False
+        assert "scorer unavailable" in scored["note"]
+        assert scored["answer"] == "a"
+
+    @pytest.mark.asyncio
+    async def test_score_with_laya_enriches_on_success(self, monkeypatch):
+        decision = {"type": "choice", "criteria": {"a": "x"}, "answer": "a"}
+
+        class Response:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "answers": {
+                        "decision": {
+                            "type": "choice",
+                            "probabilities": {"a": 0.9},
+                        }
+                    }
+                }
+
+        async def post(*_a, **_k):
+            return Response()
+
+        monkeypatch.setattr(decider._client, "post", post)
+
+        scored = await decider._score_with_laya(
+            [{"role": "user", "content": "q"}], decision
+        )
+
+        assert scored["calibrated"] is True
+
+
 def _stub_probe(monkeypatch, up):
     """Stub the health probe. Returns a dict whose "count" tracks calls."""
     probes = {"count": 0}
