@@ -18,6 +18,7 @@ LAYA_PORT (default 8000), so there is no shim in front of it:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -28,6 +29,30 @@ log = logging.getLogger(__name__)
 
 LAYA_BASE_URL = os.environ.get("LAYA_BASE_URL", "http://localhost:8000")
 DEFAULT_MODEL = os.environ.get("LAYA_DEFAULT_MODEL", "minicpm5-local")
+
+# The worker that answers decision-shaped requests itself (the grammar-
+# constrained local SLM), selected when laya's is_decision probe fires.
+DECISION_WORKER = os.environ.get("LAYA_DECISION_WORKER", "decision")
+
+# Probability mass on `true` before the is_decision probe is believed. laya
+# reports a noul answer as P(true), so this is the natural 0.5 gate.
+DECISION_PROB = float(os.environ.get("LAYA_DECISION_PROB", "0.5"))
+
+# The local llama.cpp checkpoint the decision worker prompts for structured
+# decisions, and how long that generation may take.
+DECISION_SLM_MODEL = os.environ.get(
+    "LAYA_DECISION_SLM_MODEL", "MiniCPM5-2B-Q4_K_M.gguf"
+)
+DECISION_SLM_TIMEOUT_S = float(os.environ.get("LAYA_DECISION_SLM_TIMEOUT_S", "30"))
+
+# Opt-in: re-score the SLM's decision with laya so the response carries
+# calibrated probabilities over the options. Off by default because it adds a
+# second hop to every decision; a per-request `decision_score` param overrides
+# this default. The scorer never changes which answer the SLM chose -- it only
+# attaches (or withholds) a calibrated confidence to that answer.
+DECISION_SCORE = os.environ.get("LAYA_DECISION_SCORE", "").strip().lower() in (
+    "1", "true", "yes", "on",
+)
 
 # Minimum probability mass on the winning option before the decision is used.
 # This is the winner's own probability, not laya's `confidence` -- see
@@ -57,18 +82,6 @@ HEALTH_TTL_S = float(os.environ.get("LAYA_HEALTH_TTL_S", "30"))
 # criteria to understand what each option means. Passing bare model names with
 # no description asks it to route on the strings "gpt-4o" and "gpt-4o-mini".
 ROUTES = {
-    # The cheapest possible outcome: the request *is* a decision, so laya
-    # answers it and no LLM is called at all. Classification, yes/no, scoring,
-    # ranking, guardrail checks, picking one option from a fixed set. Routing
-    # is only one instance of this shape -- the model is a general typed-answer
-    # engine, and every request served here costs a forward pass instead of a
-    # per-token bill.
-    "laya-direct": (
-        "The request is itself a decision with a fixed answer space: classify "
-        "this, is this X yes or no, score this, pick one of these options, does "
-        "this violate a policy. Anything answerable by choosing a label rather "
-        "than by writing prose."
-    ),
     "minicpm5-local": (
         "The smallest local worker: simple requests that must not leave the "
         "building, or that a 2B model can finish -- short factual answers, "
@@ -102,9 +115,9 @@ ROUTES = {
 }
 
 
-# Hosted routes, plus the decision model itself, which is up whenever this hook
-# is running. LiteLLM owns retries and failover for these.
-ALWAYS_UP = ("laya-direct", "deepseek-flash", "deepseek-v4-pro")
+# Hosted routes. LiteLLM owns retries and failover for these. The decision
+# worker is not a route option: the is_decision probe selects it directly.
+ALWAYS_UP = ("deepseek-flash", "deepseek-v4-pro")
 
 # Self-hosted routes, and where to probe them. A rented GPU is up for part of
 # the day; a laptop is up when it is open. All three local checkpoints live on
@@ -239,9 +252,10 @@ def _text_of(content):
 def build_request(messages, routes=None):
     """The /v1/systemone payload for one routing decision.
 
-    One question, not two. An extra question is an extra distribution to read
-    on every request, and a "how complex is this?" score that nothing consumes
-    is latency with no consumer.
+    Two questions, answered in a single forward pass: `route` (which worker)
+    and `is_decision` (whether this request is itself a decision the decision
+    worker should answer directly). The probe costs no extra round trip because
+    laya reads every question in the payload at once.
 
     `routes` is the currently-serving subset -- see available_routes().
 
@@ -263,7 +277,15 @@ def build_request(messages, routes=None):
                     "should not leave the building."
                 ),
                 "criteria": routes or ROUTES,
-            }
+            },
+            "is_decision": {
+                "type": "noul",
+                "instructions": (
+                    "Is this request itself a decision with a fixed answer "
+                    "space -- classify, yes/no, score, or pick one of a set "
+                    "of options -- rather than a request to generate prose?"
+                ),
+            },
         },
     }
 
@@ -314,6 +336,112 @@ def choose(body, routes=None):
     return choice
 
 
+def is_decision(body, threshold=DECISION_PROB):
+    """Whether laya's is_decision probe says the request is itself a decision.
+
+    A noul answer carries the probability mass on `true` in a field named
+    `noul` -- there is no `choice` or `probabilities` for noul. The request is
+    treated as a decision when that mass meets the threshold. Anything missing
+    or malformed is treated as prose, which is the safe default: it routes to
+    an LLM rather than the decision worker.
+    """
+    answer = (body or {}).get("answers", {}).get("is_decision")
+    if not isinstance(answer, dict):
+        return False
+
+    prob_true = answer.get("noul")
+    if not isinstance(prob_true, (int, float)):
+        log.warning("laya: malformed is_decision answer; treating as prose")
+        return False
+
+    return prob_true >= threshold
+
+
+# The shape the decision SLM must emit. llama.cpp enforces this grammar via
+# `response_format: json_schema`, so the SLM cannot go off-schema: there is no
+# free-text parse step to fail, only a schema to validate.
+DECISION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "type": {"type": "string", "enum": ["choice", "score", "noul"]},
+        "criteria": {"type": ["object", "array", "null"]},
+        "answer": {"type": ["string", "number", "boolean", "null"]},
+    },
+    "required": ["type", "answer"],
+    "additionalProperties": False,
+}
+
+DECISION_TYPES = ("choice", "score", "noul")
+
+
+def decision_payload(prompt, model=None):
+    """The llama.cpp chat request that extracts a structured decision."""
+    return {
+        "model": model or DECISION_SLM_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {"name": "decision", "schema": DECISION_SCHEMA},
+        },
+    }
+
+
+def parse_decision(text):
+    """Validate the SLM's JSON decision, or raise ValueError.
+
+    The grammar guarantees valid JSON of the schema above; this adds the
+    semantic checks the schema cannot express:
+
+    - choice: `criteria` is an object, `answer` is one of its keys.
+    - score:  `criteria` is an array, `answer` is a number within its range.
+    - noul:   `answer` is a boolean (normalised from "true"/"false"/0/1).
+    """
+    try:
+        decision = json.loads(text)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"decision worker returned invalid JSON: {error}") from error
+
+    if not isinstance(decision, dict):
+        raise ValueError("decision worker returned a non-object")
+
+    dtype = decision.get("type")
+    if dtype not in DECISION_TYPES:
+        raise ValueError(f"decision worker returned unknown type {dtype!r}")
+
+    answer = decision.get("answer")
+    criteria = decision.get("criteria")
+
+    if dtype == "choice":
+        if not isinstance(criteria, dict) or not criteria:
+            raise ValueError("choice decision must carry a non-empty criteria object")
+        if answer not in criteria:
+            raise ValueError(f"choice answer {answer!r} is not one of the criteria")
+    elif dtype == "score":
+        if not isinstance(criteria, list) or not criteria:
+            raise ValueError("score decision must carry a non-empty criteria list")
+        if not isinstance(answer, (int, float)):
+            raise ValueError("score answer must be a number")
+        if not 0 <= answer < len(criteria):
+            raise ValueError(f"score answer {answer!r} is out of range")
+    else:  # noul
+        if isinstance(answer, bool):
+            pass
+        elif answer in (0, 1):
+            decision["answer"] = bool(answer)
+        elif isinstance(answer, str) and answer.lower() in ("true", "false"):
+            decision["answer"] = answer.lower() == "true"
+        else:
+            raise ValueError(f"noul answer must be a boolean, got {answer!r}")
+
+    return decision
+
+
+def format_decision(decision):
+    """The assistant message content handed back to the client."""
+    return json.dumps(decision)
+
+
 # One client for the process. A new connection per request would add a TLS or
 # TCP handshake to a decision that is supposed to be the cheap part.
 _client = httpx.AsyncClient(timeout=TIMEOUT_S)
@@ -349,7 +477,10 @@ async def decide(messages):
             headers=_auth_headers(),
         )
         response.raise_for_status()
-        return choose(response.json(), routes) or DEFAULT_MODEL
+        body = response.json()
+        if is_decision(body):
+            return DECISION_WORKER
+        return choose(body, routes) or DEFAULT_MODEL
     except httpx.HTTPError as error:
         log.warning("laya: %s; falling back to %s", error, DEFAULT_MODEL)
         return DEFAULT_MODEL
@@ -359,9 +490,15 @@ async def decide(messages):
 
 
 try:
+    import litellm as _litellm
     from litellm.integrations.custom_logger import CustomLogger
+    from litellm.llms.custom_llm import CustomLLM
+    from litellm.types.utils import Choices, Message, ModelResponse
 except ImportError:  # pragma: no cover - lets the logic above be tested alone
+    _litellm = None
     CustomLogger = object
+    CustomLLM = object
+    Choices = Message = ModelResponse = None
 
 
 class LayaRouter(CustomLogger):
@@ -392,3 +529,275 @@ class LayaRouter(CustomLogger):
 
 
 proxy_handler_instance = LayaRouter()
+
+
+# --- decision worker -------------------------------------------------------
+
+# One blocking client for the SLM call. The proxy is async, so acompletion()
+# runs this in a worker thread; completion() uses it directly.
+_slm_client = httpx.Client(timeout=DECISION_SLM_TIMEOUT_S)
+
+# A blocking client for the scorer hop, so completion() can re-score without
+# touching the event loop. acompletion() scores through `_client` instead.
+_laya_sync_client = httpx.Client(timeout=TIMEOUT_S)
+
+
+def _extract_decision(messages):
+    """Ask the local SLM for a decision; returns the parsed decision dict.
+
+    Raises httpx.HTTPError or ValueError on failure -- the decision worker fails
+    loudly rather than returning a wrong answer.
+    """
+    prompt = context_from(messages)
+    response = _slm_client.post(
+        f"{LLAMACPP_BASE_URL.rstrip('/')}/chat/completions",
+        json=decision_payload(prompt),
+    )
+    response.raise_for_status()
+    content = response.json()["choices"][0]["message"]["content"]
+    return parse_decision(content)
+
+
+def decision_score_request(messages, decision):
+    """The /v1/systemone payload that re-scores an extracted decision.
+
+    Re-asks the SLM's typed question so laya can attach calibrated
+    probabilities to the answer space. The SLM's own `answer` is withheld so
+    the calibrated distribution is independent of the SLM's choice.
+    """
+    question = {
+        "type": decision["type"],
+        "instructions": "Answer this decision based on the request.",
+    }
+    # Only choice and score carry an answer space worth re-scoring; a noul's
+    # space is the fixed {true, false} pair, and its criteria is not part of
+    # the extracted decision.
+    if decision["type"] in ("choice", "score"):
+        criteria = decision.get("criteria")
+        if criteria is not None:
+            question["criteria"] = criteria
+
+    payload = {
+        "state": context_from(messages),
+        "questions": {"decision": question},
+    }
+    decision_model = os.environ.get("LAYA_DECISION_MODEL", "typed-decisions")
+    if decision_model:
+        payload["model"] = decision_model
+    return payload
+
+
+def _degraded(decision, note):
+    """The decision, flagged as not confidently calibrated."""
+    result = dict(decision)
+    result["calibrated"] = False
+    result["note"] = note
+    return result
+
+
+def _apply_score(decision, laya_answer):
+    """Enrich a decision with laya's calibrated probabilities, or degrade.
+
+    The gate is the winning option's own probability -- the SLM's answer, the
+    same quantity choose() gates on -- not laya's `confidence`.
+    """
+    dtype = decision["type"]
+    probabilities = laya_answer.get("probabilities") or {}
+
+    if dtype == "choice":
+        winner = probabilities.get(decision["answer"], 0.0)
+        calibrated = probabilities
+    elif dtype == "score":
+        winner = probabilities.get(str(decision["answer"]), 0.0)
+        calibrated = probabilities
+    else:  # noul
+        noul = laya_answer.get("noul")
+        if not isinstance(noul, (int, float)):
+            return _degraded(decision, "laya returned no noul probability")
+        winner = noul if decision["answer"] else 1.0 - noul
+        calibrated = {"true": noul, "false": round(1.0 - noul, 4)}
+
+    result = dict(decision)
+    result["calibrated_probabilities"] = calibrated
+    if winner < MIN_PROB:
+        result["calibrated"] = False
+        result["note"] = (
+            f"calibrated probability {winner:.2f} on {decision['answer']!r} "
+            f"is below the {MIN_PROB} gate"
+        )
+        return result
+    result["calibrated"] = True
+    return result
+
+
+def _score_with_laya_sync(messages, decision):
+    """The sync scorer hop. Degrades explicitly, never raises.
+
+    The scorer is a convenience on top of an already-valid SLM answer, so a
+    failed score must not take the decision path down: it returns the SLM's
+    answer flagged `calibrated: false` with the reason.
+    """
+    try:
+        response = _laya_sync_client.post(
+            f"{LAYA_BASE_URL}/v1/systemone",
+            json=decision_score_request(messages, decision),
+            headers=_auth_headers(),
+        )
+        response.raise_for_status()
+        answer = response.json().get("answers", {}).get("decision")
+        if not isinstance(answer, dict):
+            return _degraded(decision, "laya returned no decision score")
+        return _apply_score(decision, answer)
+    except (httpx.HTTPError, ValueError, KeyError, TypeError) as error:
+        log.warning("decision scorer: %s; returning SLM answer", error)
+        return _degraded(decision, f"scorer unavailable: {error}")
+
+
+async def _score_with_laya(messages, decision):
+    """The async scorer hop. Degrades explicitly, never raises."""
+    try:
+        response = await _client.post(
+            f"{LAYA_BASE_URL}/v1/systemone",
+            json=decision_score_request(messages, decision),
+            headers=_auth_headers(),
+        )
+        response.raise_for_status()
+        answer = response.json().get("answers", {}).get("decision")
+        if not isinstance(answer, dict):
+            return _degraded(decision, "laya returned no decision score")
+        return _apply_score(decision, answer)
+    except (httpx.HTTPError, ValueError, KeyError, TypeError) as error:
+        log.warning("decision scorer: %s; returning SLM answer", error)
+        return _degraded(decision, f"scorer unavailable: {error}")
+
+
+def _log_decision(messages, decision):
+    """Emit one structured line per decision for the epic-2 training set.
+
+    The fields mirror what the fine-tuned model must emit in one call: the
+    prompt, the is_decision flag (always true here -- the worker only serves
+    decisions), the extracted answer space and chosen answer, the route that
+    served it, and the calibrated probabilities when the scorer ran.
+    """
+    record = {
+        "prompt": context_from(messages),
+        "was_decision": True,
+        "type": decision["type"],
+        "extracted_options": decision.get("criteria"),
+        "chosen_answer": decision["answer"],
+        "route": DECISION_WORKER,
+        "calibrated_probabilities": decision.get("calibrated_probabilities"),
+    }
+    log.info("decision: %s", json.dumps(record))
+
+
+def _decide_with_slm_sync(messages, score=False):
+    """Answer a decision prompt; returns assistant text.
+
+    With `score`, the extracted decision is re-scored by laya so the response
+    carries calibrated probabilities. The SLM call still fails loudly; only
+    the optional scorer hop degrades.
+    """
+    decision = _extract_decision(messages)
+    if score:
+        decision = _score_with_laya_sync(messages, decision)
+    _log_decision(messages, decision)
+    return format_decision(decision)
+
+
+async def _decide_with_slm(messages, score=False):
+    """Async wrapper so acompletion() does not block the event loop."""
+    import asyncio
+
+    decision = await asyncio.to_thread(_extract_decision, messages)
+    if score:
+        decision = await _score_with_laya(messages, decision)
+    _log_decision(messages, decision)
+    return format_decision(decision)
+
+
+def _score_enabled(optional_params):
+    """Whether the scorer hop is on: per-request flag, else DECISION_SCORE."""
+    flag = (optional_params or {}).get("decision_score")
+    if flag is None:
+        return DECISION_SCORE
+    return bool(flag)
+
+
+def _model_response(model_response, content):
+    """Fill a LiteLLM ModelResponse with one assistant message."""
+    if ModelResponse is None:  # pragma: no cover - litellm missing
+        raise RuntimeError("litellm is required to serve the decision worker")
+    model_response.choices = [
+        Choices(message=Message(content=content, role="assistant"), finish_reason="stop")
+    ]
+    return model_response
+
+
+class DecisionWorker(CustomLLM):
+    """A LiteLLM CustomLLM that answers decision prompts with the local SLM.
+
+    Registered under the provider name "decision", so model_list references it
+    as `model: decision/decision`. decision_payload() constrains the SLM to a
+    fixed JSON shape, and parse_decision() validates it, so the worker never
+    hands a malformed decision back to the caller.
+
+    With `decision_score` in the request (or DECISION_SCORE set), the extracted
+    decision is re-scored by laya so the response carries calibrated
+    probabilities; below the MIN_PROB gate the SLM's answer is returned with an
+    explicit `calibrated: false` note.
+    """
+
+    def completion(
+        self,
+        model,
+        messages,
+        api_base,
+        custom_prompt_dict,
+        model_response,
+        print_verbose,
+        encoding,
+        api_key,
+        logging_obj,
+        optional_params,
+        acompletion=None,
+        litellm_params=None,
+        logger_fn=None,
+        headers=None,
+        timeout=None,
+        client=None,
+    ):
+        score = _score_enabled(optional_params)
+        content = _decide_with_slm_sync(messages, score=score)
+        return _model_response(model_response, content)
+
+    async def acompletion(
+        self,
+        model,
+        messages,
+        api_base,
+        custom_prompt_dict,
+        model_response,
+        print_verbose,
+        encoding,
+        api_key,
+        logging_obj,
+        optional_params,
+        acompletion=None,
+        litellm_params=None,
+        logger_fn=None,
+        headers=None,
+        timeout=None,
+        client=None,
+    ):
+        score = _score_enabled(optional_params)
+        content = await _decide_with_slm(messages, score=score)
+        return _model_response(model_response, content)
+
+
+_decision_worker_instance = None
+if _litellm is not None:
+    _decision_worker_instance = DecisionWorker()
+    _litellm.custom_provider_map.append(
+        {"provider": "decision", "custom_handler": _decision_worker_instance}
+    )

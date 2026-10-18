@@ -8,13 +8,20 @@ not leave the building.
  client ──► LiteLLM :4000            model: "laya-router"
               │
               ├──► laya :8000   /v1/systemone  ~70–500ms, typed answer
+              │       one call: route (choice) + is_decision (noul)
               │
-              └──► laya-direct      answered by the decision model, no LLM
-                   minicpm5-local     MiniCPM5-2B on the laptop
-                   bonsai-local       Ternary-Bonsai-2-9B on the laptop
-                   ornith-local       Ornith-1.5-35B on the laptop
-                   runpod             Qwen3.8-Flash-Next on the rented GPU
-                   deepseek-flash │ deepseek-v4-pro
+              ├── is_decision true ──► decision worker ──► llama.cpp :9080
+              │                         MiniCPM5-2B
+              │                         grammar-constrained JSON
+              │                         {type, criteria, answer}
+              │                         (optional laya re-score for
+              │                          calibrated probabilities)
+              │
+              └── is_decision false ─► minicpm5-local     MiniCPM5-2B
+                                        bonsai-local       Ternary-Bonsai-2-9B
+                                        ornith-local       Ornith-1.5-35B
+                                        runpod             Qwen3.8-Flash-Next
+                                        deepseek-flash | deepseek-v4-pro
 ```
 
 ## Why a decision model rather than a prompt
@@ -39,6 +46,42 @@ That property is worth more than the accuracy numbers. A router that is wrong
 10% of the time costs you some quality; a router that *silently stops routing*
 costs you the whole feature, and looks identical from outside.
 
+## Decision-shaped requests
+
+The router does not only pick a worker — it also recognises when the request
+*is* the decision. A classification, a yes/no, a scoring, a pick-one-of-these:
+those have a fixed answer space and should not pay a per-token bill from a
+general LLM.
+
+The same `/v1/systemone` call that asks `route` also asks a second question,
+`is_decision`, as a `noul` probe (P(true)). One forward pass, one round trip.
+When it fires, the request is rewritten to the `decision` worker instead of a
+chat model.
+
+The decision worker is a local llama.cpp checkpoint (`MiniCPM5-2B`), prompted
+with a **grammar-constrained** output: `response_format: json_schema` pins the
+reply to a fixed shape, so the SLM cannot go off-schema and there is no
+free-text parse step to fail.
+
+```
+{ "type": "choice" | "score" | "noul",
+  "criteria": {option: description} | [levels],
+  "answer": <one option> | <index> | <bool> }
+```
+
+laya stays the **router** and, where calibrated probabilities are wanted, the
+**scorer**. The SLM extracts the answer space dynamically — novel options, not a
+fixed taxonomy — and an opt-in second hop (`LAYA_DECISION_SCORE=1`, or
+`decision_score: true` per request) re-scores that space with laya so the reply
+carries calibrated probabilities. Below `LAYA_MIN_PROB` the reply degrades
+explicitly: the SLM's own answer with `"calibrated": false` and a note, never a
+confident wrong answer.
+
+Every decision is logged as one JSON line (`decision: {...}`) carrying the
+prompt, the is_decision flag, the extracted options, the chosen answer, the
+route, and the calibrated probabilities. That is the training set for the single
+fine-tuned model that emits `{route, is_decision, decision}` in one call.
+
 ## Is LiteLLM the right thing to build on
 
 Yes, with one caveat.
@@ -55,9 +98,10 @@ classifier backends is JEV. If hosted TypeSafe Jev is acceptable, most of
 `decider.py` collapses into a `complexity_router_config` block — see the bottom
 of `LLM_config.yaml`. Keep the hook if you need routing on something that is
 not complexity, if beta config keys are a problem, or if the decision itself
-must stay in your network. Two routes here are outside a complexity ladder by
-construction: `laya-direct`, where no LLM is called at all, and the local
-routes, where "this must not leave the building" is not a point on that scale.
+must stay in your network. Two things here are outside a complexity ladder by
+construction: the decision worker, where no general LLM is called at all, and
+the local routes, where "this must not leave the building" is not a point on
+that scale.
 
 ## Which laya
 
@@ -68,6 +112,13 @@ output position rather than by generating prose. It runs in about 1024 tokens
 of context, which is why `decider.py` sends only the tail of the conversation.
 It serves the same `/v1/systemone` API directly, so the whole decision is one
 HTTP call with no shim in front of it.
+
+laya's role here is narrow but load-bearing: it answers `route` and
+`is_decision` in one forward pass and, when the optional scorer hop is on,
+re-scores the decision worker's extracted options. It does not answer the
+decision itself — that is the local SLM's job, because the SLM can generate
+novel options where laya can only read probabilities off an answer space it was
+given.
 
 One thing to check after the model is loaded: the whole value here is
 *calibrated* probabilities, and quantized or fine-tuned weights move the
@@ -85,7 +136,8 @@ LAYA_PORT=8000 LAYA_DEVICE=cpu python laya_runner.py
 LAYA_PORT=8000 LAYA_DEVICE=cpu laya-serve
 
 # 2) The local llama.cpp server, one OpenAI-compatible endpoint serving the
-#    GGUF checkpoints configured in ~/.config/eca/config.json
+#    GGUF checkpoints configured in ~/.config/eca/config.json, plus the
+#    decision worker's SLM (DECISION_SLM_MODEL, default MiniCPM5-2B)
 llama-server -m MiniCPM5-2B-Q4_K_M.gguf --port 9080
 # switch checkpoints as needed; all three share :9080
 # llama-server -m Ternary-Bonsai-2-9B-PQ2_0-MTP-Q8_0.gguf --port 9080
@@ -102,7 +154,7 @@ curl http://localhost:4000/v1/chat/completions \
   -d '{"model":"laya-router","messages":[{"role":"user","content":"Hi"}]}'
 ```
 
-`LAYA_PORT` / `LAYA_DEVICE` configure the decision server; `LAYA_API_KEY`
+`LAYA_PORT` / `LAYA_DEVICE` configure the laya server; `LAYA_API_KEY`
 (authenticated calls) and `LAYA_DECISION_MODEL` (the typed-decisions task) are
 optional. `LAYA_DECISION_MODEL` is read at call-time so it can be overridden per
 process.
@@ -146,6 +198,12 @@ before — see below.
 | `LAYA_VIRTUAL_MODEL` | `laya-router` | The name that triggers routing |
 | `LAYA_HEALTH_TTL_S` | `30` | How long a worker health probe is trusted |
 | `LAYA_PROBE_TIMEOUT_S` | `0.3` | Probe cap; must not eat the decision budget |
+| `LAYA_DECISION_WORKER` | `decision` | The worker the `is_decision` probe routes to |
+| `LAYA_DECISION_PROB` | `0.5` | P(true) before the probe treats a request as a decision |
+| `LAYA_DECISION_MODEL` | `typed-decisions` | The typed-decisions task laya serves |
+| `LAYA_DECISION_SLM_MODEL` | `MiniCPM5-2B-Q4_K_M.gguf` | Checkpoint the decision worker prompts |
+| `LAYA_DECISION_SLM_TIMEOUT_S` | `30` | Generation cap for the decision worker |
+| `LAYA_DECISION_SCORE` | off | Opt-in laya re-score of extracted decisions |
 | `LLAMACPP_BASE_URL` | `:9080/v1` | Local llama.cpp server (all three checkpoints) |
 | `RUNPOD_BASE_URL` | the pod proxy | Rented GPU; used by the health probe |
 
