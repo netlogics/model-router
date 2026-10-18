@@ -45,6 +45,15 @@ DECISION_SLM_MODEL = os.environ.get(
 )
 DECISION_SLM_TIMEOUT_S = float(os.environ.get("LAYA_DECISION_SLM_TIMEOUT_S", "30"))
 
+# Opt-in: re-score the SLM's decision with laya so the response carries
+# calibrated probabilities over the options. Off by default because it adds a
+# second hop to every decision; a per-request `decision_score` param overrides
+# this default. The scorer never changes which answer the SLM chose -- it only
+# attaches (or withholds) a calibrated confidence to that answer.
+DECISION_SCORE = os.environ.get("LAYA_DECISION_SCORE", "").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+
 # Minimum probability mass on the winning option before the decision is used.
 # This is the winner's own probability, not laya's `confidence` -- see
 # choose() for why the two are not interchangeable.
@@ -540,9 +549,13 @@ proxy_handler_instance = LayaRouter()
 # runs this in a worker thread; completion() uses it directly.
 _slm_client = httpx.Client(timeout=DECISION_SLM_TIMEOUT_S)
 
+# A blocking client for the scorer hop, so completion() can re-score without
+# touching the event loop. acompletion() scores through `_client` instead.
+_laya_sync_client = httpx.Client(timeout=TIMEOUT_S)
 
-def _decide_with_slm_sync(messages):
-    """Ask the local SLM to answer a decision prompt; returns assistant text.
+
+def _extract_decision(messages):
+    """Ask the local SLM for a decision; returns the parsed decision dict.
 
     Raises httpx.HTTPError or ValueError on failure -- the decision worker fails
     loudly rather than returning a wrong answer.
@@ -554,14 +567,151 @@ def _decide_with_slm_sync(messages):
     )
     response.raise_for_status()
     content = response.json()["choices"][0]["message"]["content"]
-    return format_decision(parse_decision(content))
+    return parse_decision(content)
 
 
-async def _decide_with_slm(messages):
+def decision_score_request(messages, decision):
+    """The /v1/systemone payload that re-scores an extracted decision.
+
+    Re-asks the SLM's typed question so laya can attach calibrated
+    probabilities to the answer space. The SLM's own `answer` is withheld so
+    the calibrated distribution is independent of the SLM's choice.
+    """
+    question = {
+        "type": decision["type"],
+        "instructions": "Answer this decision based on the request.",
+    }
+    # Only choice and score carry an answer space worth re-scoring; a noul's
+    # space is the fixed {true, false} pair, and its criteria is not part of
+    # the extracted decision.
+    if decision["type"] in ("choice", "score"):
+        criteria = decision.get("criteria")
+        if criteria is not None:
+            question["criteria"] = criteria
+
+    payload = {
+        "state": context_from(messages),
+        "questions": {"decision": question},
+    }
+    decision_model = os.environ.get("LAYA_DECISION_MODEL", "typed-decisions")
+    if decision_model:
+        payload["model"] = decision_model
+    return payload
+
+
+def _degraded(decision, note):
+    """The decision, flagged as not confidently calibrated."""
+    result = dict(decision)
+    result["calibrated"] = False
+    result["note"] = note
+    return result
+
+
+def _apply_score(decision, laya_answer):
+    """Enrich a decision with laya's calibrated probabilities, or degrade.
+
+    The gate is the winning option's own probability -- the SLM's answer, the
+    same quantity choose() gates on -- not laya's `confidence`.
+    """
+    dtype = decision["type"]
+    probabilities = laya_answer.get("probabilities") or {}
+
+    if dtype == "choice":
+        winner = probabilities.get(decision["answer"], 0.0)
+        calibrated = probabilities
+    elif dtype == "score":
+        winner = probabilities.get(str(decision["answer"]), 0.0)
+        calibrated = probabilities
+    else:  # noul
+        noul = laya_answer.get("noul")
+        if not isinstance(noul, (int, float)):
+            return _degraded(decision, "laya returned no noul probability")
+        winner = noul if decision["answer"] else 1.0 - noul
+        calibrated = {"true": noul, "false": round(1.0 - noul, 4)}
+
+    result = dict(decision)
+    result["calibrated_probabilities"] = calibrated
+    if winner < MIN_PROB:
+        result["calibrated"] = False
+        result["note"] = (
+            f"calibrated probability {winner:.2f} on {decision['answer']!r} "
+            f"is below the {MIN_PROB} gate"
+        )
+        return result
+    result["calibrated"] = True
+    return result
+
+
+def _score_with_laya_sync(messages, decision):
+    """The sync scorer hop. Degrades explicitly, never raises.
+
+    The scorer is a convenience on top of an already-valid SLM answer, so a
+    failed score must not take the decision path down: it returns the SLM's
+    answer flagged `calibrated: false` with the reason.
+    """
+    try:
+        response = _laya_sync_client.post(
+            f"{LAYA_BASE_URL}/v1/systemone",
+            json=decision_score_request(messages, decision),
+            headers=_auth_headers(),
+        )
+        response.raise_for_status()
+        answer = response.json().get("answers", {}).get("decision")
+        if not isinstance(answer, dict):
+            return _degraded(decision, "laya returned no decision score")
+        return _apply_score(decision, answer)
+    except (httpx.HTTPError, ValueError, KeyError, TypeError) as error:
+        log.warning("decision scorer: %s; returning SLM answer", error)
+        return _degraded(decision, f"scorer unavailable: {error}")
+
+
+async def _score_with_laya(messages, decision):
+    """The async scorer hop. Degrades explicitly, never raises."""
+    try:
+        response = await _client.post(
+            f"{LAYA_BASE_URL}/v1/systemone",
+            json=decision_score_request(messages, decision),
+            headers=_auth_headers(),
+        )
+        response.raise_for_status()
+        answer = response.json().get("answers", {}).get("decision")
+        if not isinstance(answer, dict):
+            return _degraded(decision, "laya returned no decision score")
+        return _apply_score(decision, answer)
+    except (httpx.HTTPError, ValueError, KeyError, TypeError) as error:
+        log.warning("decision scorer: %s; returning SLM answer", error)
+        return _degraded(decision, f"scorer unavailable: {error}")
+
+
+def _decide_with_slm_sync(messages, score=False):
+    """Answer a decision prompt; returns assistant text.
+
+    With `score`, the extracted decision is re-scored by laya so the response
+    carries calibrated probabilities. The SLM call still fails loudly; only
+    the optional scorer hop degrades.
+    """
+    decision = _extract_decision(messages)
+    if score:
+        decision = _score_with_laya_sync(messages, decision)
+    return format_decision(decision)
+
+
+async def _decide_with_slm(messages, score=False):
     """Async wrapper so acompletion() does not block the event loop."""
     import asyncio
 
-    return await asyncio.to_thread(_decide_with_slm_sync, messages)
+    decision = await asyncio.to_thread(_extract_decision, messages)
+    if score:
+        decision = await _score_with_laya(messages, decision)
+    return format_decision(decision)
+
+
+def _score_enabled(optional_params):
+    """Whether the scorer hop is on: per-request flag, else DECISION_SCORE."""
+    flag = (optional_params or {}).get("decision_score")
+    if flag is None:
+        return DECISION_SCORE
+    return bool(flag)
 
 
 def _model_response(model_response, content):
@@ -581,6 +731,11 @@ class DecisionWorker(CustomLLM):
     as `model: decision/decision`. decision_payload() constrains the SLM to a
     fixed JSON shape, and parse_decision() validates it, so the worker never
     hands a malformed decision back to the caller.
+
+    With `decision_score` in the request (or DECISION_SCORE set), the extracted
+    decision is re-scored by laya so the response carries calibrated
+    probabilities; below the MIN_PROB gate the SLM's answer is returned with an
+    explicit `calibrated: false` note.
     """
 
     def completion(
@@ -602,7 +757,8 @@ class DecisionWorker(CustomLLM):
         timeout=None,
         client=None,
     ):
-        content = _decide_with_slm_sync(messages)
+        score = _score_enabled(optional_params)
+        content = _decide_with_slm_sync(messages, score=score)
         return _model_response(model_response, content)
 
     async def acompletion(
@@ -624,7 +780,8 @@ class DecisionWorker(CustomLLM):
         timeout=None,
         client=None,
     ):
-        content = await _decide_with_slm(messages)
+        score = _score_enabled(optional_params)
+        content = await _decide_with_slm(messages, score=score)
         return _model_response(model_response, content)
 
 
