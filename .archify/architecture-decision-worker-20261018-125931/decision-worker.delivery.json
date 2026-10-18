@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "receiptId": "b000d90f-078f-487b-b9c1-c8e33659c0a2",
+  "status": "current",
+  "command": "deliver",
+  "type": "architecture",
+  "input": "/home/phil/dev/model-router/.archify/architecture-decision-worker-20261018-125931/candidate.json",
+  "output": "/home/phil/dev/model-router/.archify/architecture-decision-worker-20261018-125931/decision-worker.html",
+  "specification": {
+    "sha256": "0587ab1baaeabe63acd2acdbb63bd235b0ef90a168a83ecfa4cd12aeca388299",
+    "bytes": 5301
+  },
+  "artifact": {
+    "sha256": "1cf39f4e6b1198e31e52c5efae6c72e86ab7231459c23d6a1ff5e1ee489c8adf",
+    "bytes": 824273
+  }
+}

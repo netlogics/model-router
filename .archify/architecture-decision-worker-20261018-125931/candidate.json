@@ -1,0 +1,157 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Decision Worker Routing Flow",
+    "locale": "en",
+    "output": ".archify/architecture-decision-worker-20261018-125931/decision-worker.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "git@github.com:netlogics/model-router.git",
+      "revision": "5fd94aa1b6c147f459ca3d96a0f80ee927d91842",
+      "link_mode": "local-only"
+    }
+  },
+  "components": [
+    {
+      "id": "client",
+      "type": "external",
+      "label": "Client",
+      "sublabel": "chat completion",
+      "pos": [40, 250],
+      "size": [120, 64]
+    },
+    {
+      "id": "proxy",
+      "type": "backend",
+      "label": "LiteLLM proxy",
+      "sublabel": ":4000",
+      "pos": [240, 250],
+      "size": [140, 64],
+      "sources": [
+        { "path": "LLM_config.yaml", "line": 1, "end_line": 15 }
+      ]
+    },
+    {
+      "id": "decider",
+      "type": "backend",
+      "label": "decider.LayaRouter",
+      "sublabel": "async_pre_call_hook",
+      "pos": [460, 250],
+      "size": [170, 64],
+      "sources": [
+        { "path": "decider.py", "line": 504, "end_line": 531 },
+        { "path": "decider.py", "line": 464, "end_line": 489 }
+      ]
+    },
+    {
+      "id": "laya",
+      "type": "backend",
+      "label": "laya",
+      "sublabel": "/v1/systemone :8000",
+      "pos": [470, 80],
+      "size": [150, 64],
+      "sources": [
+        { "path": "decider.py", "line": 252, "end_line": 298 },
+        { "path": "decider.py", "line": 464, "end_line": 489 }
+      ]
+    },
+    {
+      "id": "decision-worker",
+      "type": "backend",
+      "label": "DecisionWorker",
+      "sublabel": "decision/decision",
+      "pos": [740, 250],
+      "size": [150, 64],
+      "sources": [
+        { "path": "decider.py", "line": 737, "end_line": 797 },
+        { "path": "decider.py", "line": 798, "end_line": 803 },
+        { "path": "LLM_config.yaml", "line": 71, "end_line": 74 }
+      ]
+    },
+    {
+      "id": "slm",
+      "type": "backend",
+      "label": "decision SLM",
+      "sublabel": "MiniCPM5-2B · json_schema",
+      "pos": [750, 80],
+      "size": [150, 64],
+      "sources": [
+        { "path": "decider.py", "line": 43, "end_line": 45 },
+        { "path": "decider.py", "line": 377, "end_line": 387 },
+        { "path": "decider.py", "line": 545, "end_line": 556 }
+      ]
+    },
+    {
+      "id": "deepseek",
+      "type": "cloud",
+      "label": "DeepSeek",
+      "sublabel": "flash · v4-pro · hosted",
+      "pos": [300, 430],
+      "size": [130, 64],
+      "sources": [
+        { "path": "LLM_config.yaml", "line": 22, "end_line": 36 }
+      ]
+    },
+    {
+      "id": "local",
+      "type": "backend",
+      "label": "local workers",
+      "sublabel": "minicpm5 · bonsai · ornith",
+      "pos": [490, 430],
+      "size": [150, 64],
+      "sources": [
+        { "path": "LLM_config.yaml", "line": 41, "end_line": 57 },
+        { "path": "decider.py", "line": 130, "end_line": 135 }
+      ]
+    },
+    {
+      "id": "runpod",
+      "type": "cloud",
+      "label": "RunPod",
+      "sublabel": "rented GPU · Qwen3.8",
+      "pos": [700, 430],
+      "size": [130, 64],
+      "sources": [
+        { "path": "LLM_config.yaml", "line": 62, "end_line": 66 },
+        { "path": "decider.py", "line": 126, "end_line": 128 }
+      ]
+    }
+  ],
+  "connections": [
+    { "id": "client-to-proxy", "from": "client", "to": "proxy", "label": "chat completion", "variant": "emphasis" },
+    { "id": "proxy-to-decider", "from": "proxy", "to": "decider", "label": "async_pre_call_hook" },
+    { "id": "decider-to-laya", "from": "decider", "to": "laya", "label": "probe route + is_decision", "fromSide": "top", "toSide": "bottom" },
+    { "id": "decider-to-decision-worker", "from": "decider", "to": "decision-worker", "label": "is_decision" },
+    { "id": "decider-to-deepseek", "from": "decider", "to": "deepseek", "label": "route", "fromSide": "bottom", "toSide": "top" },
+    { "id": "decider-to-local", "from": "decider", "to": "local", "label": "route", "fromSide": "bottom", "toSide": "top" },
+    { "id": "decider-to-runpod", "from": "decider", "to": "runpod", "label": "route", "fromSide": "bottom", "toSide": "top" },
+    { "id": "decision-worker-to-slm", "from": "decision-worker", "to": "slm", "label": "chat/completions · json_schema", "fromSide": "top", "toSide": "bottom" }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Routing",
+      "items": [
+        "Clients call model=laya-router; async_pre_call_hook rewrites data['model'] before LiteLLM dispatches.",
+        "laya answers route and is_decision in a single forward pass over /v1/systemone."
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Decision worker",
+      "items": [
+        "is_decision routes to DecisionWorker, a LiteLLM CustomLLM registered as decision/decision.",
+        "The local SLM is grammar-constrained via response_format json_schema; a malformed answer fails loudly."
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Privacy & fallback",
+      "items": [
+        "Local routes never fall back to a hosted API; RunPod is the only acceptable fallback for local workers.",
+        "The gate is the winning option's own probability (MIN_PROB), not laya's confidence."
+      ]
+    }
+  ]
+}
