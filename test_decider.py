@@ -773,6 +773,35 @@ class TestDecisionWorkerDispatch:
         assert result["calibrated"] is True
         assert result["calibrated_probabilities"] == {"a": 0.9, "b": 0.1}
 
+    def test_log_decision_records_a_structured_line(self, caplog):
+        import logging
+
+        decision = {
+            "type": "choice",
+            "criteria": {"cat": "small", "dog": "large"},
+            "answer": "dog",
+            "calibrated_probabilities": {"cat": 0.3, "dog": 0.7},
+        }
+
+        with caplog.at_level(logging.INFO, logger="decider"):
+            decider._log_decision(
+                [{"role": "user", "content": "which is bigger?"}], decision
+            )
+
+        assert len(caplog.messages) == 1
+        assert caplog.messages[0].startswith("decision: ")
+        record = json.loads(caplog.messages[0].split("decision: ", 1)[1])
+
+        assert record == {
+            "prompt": "which is bigger?",
+            "was_decision": True,
+            "type": "choice",
+            "extracted_options": {"cat": "small", "dog": "large"},
+            "chosen_answer": "dog",
+            "route": "decision",
+            "calibrated_probabilities": {"cat": 0.3, "dog": 0.7},
+        }
+
 
 def _fake_litellm_types(monkeypatch):
     """Fake the litellm types so the worker's response conversion is testable.
