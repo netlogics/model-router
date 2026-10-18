@@ -683,6 +683,26 @@ async def _score_with_laya(messages, decision):
         return _degraded(decision, f"scorer unavailable: {error}")
 
 
+def _log_decision(messages, decision):
+    """Emit one structured line per decision for the epic-2 training set.
+
+    The fields mirror what the fine-tuned model must emit in one call: the
+    prompt, the is_decision flag (always true here -- the worker only serves
+    decisions), the extracted answer space and chosen answer, the route that
+    served it, and the calibrated probabilities when the scorer ran.
+    """
+    record = {
+        "prompt": context_from(messages),
+        "was_decision": True,
+        "type": decision["type"],
+        "extracted_options": decision.get("criteria"),
+        "chosen_answer": decision["answer"],
+        "route": DECISION_WORKER,
+        "calibrated_probabilities": decision.get("calibrated_probabilities"),
+    }
+    log.info("decision: %s", json.dumps(record))
+
+
 def _decide_with_slm_sync(messages, score=False):
     """Answer a decision prompt; returns assistant text.
 
@@ -693,6 +713,7 @@ def _decide_with_slm_sync(messages, score=False):
     decision = _extract_decision(messages)
     if score:
         decision = _score_with_laya_sync(messages, decision)
+    _log_decision(messages, decision)
     return format_decision(decision)
 
 
@@ -703,6 +724,7 @@ async def _decide_with_slm(messages, score=False):
     decision = await asyncio.to_thread(_extract_decision, messages)
     if score:
         decision = await _score_with_laya(messages, decision)
+    _log_decision(messages, decision)
     return format_decision(decision)
 
 
